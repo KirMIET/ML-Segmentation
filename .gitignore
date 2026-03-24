@@ -1,2 +1,7 @@
 .venv
 .vscode
+
+dataset/
+seg_train_runs/
+*.csv
+changes/
