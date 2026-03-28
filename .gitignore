@@ -1,7 +1,11 @@
 .venv
+venv/
 .vscode
+
+__pycache__/
 
 dataset/
 seg_train_runs/
 *.csv
 changes/
+model_checkpoints/

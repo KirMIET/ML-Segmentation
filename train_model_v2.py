@@ -1,0 +1,628 @@
+import os
+import random
+from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.encoders import get_preprocessing_fn
+
+from tqdm.auto import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from src.mixup_augmentations import SegmentationAugmentations
+
+# =========================
+# CONFIG
+# =========================
+DATA_ROOT = Path(
+    r"dataset/best_dataset/train"
+)
+IMAGES_DIR = DATA_ROOT / "images"
+MASKS_DIR = DATA_ROOT / "masks"
+SAVE_DIR = Path("./model_checkpoints")
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+IMG_SIZE = 352
+BATCH_SIZE = 8
+NUM_EPOCHS = 15
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+VAL_RATIO = 0.2
+NUM_WORKERS = 4
+SEED = 42
+THRESHOLD = 0.5
+
+MODEL_NAME = "UnetPlusPlus"
+ENCODER_NAME = "timm-efficientnet-b0"
+ENCODER_WEIGHTS = "noisy-student"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Параметры для комбинированного лосса
+DICE_WEIGHT = 0.5
+BCE_WEIGHT = 0.5
+
+# Параметры для early stopping
+EARLY_STOPPING_PATIENCE = 5
+
+# Параметры для gradient clipping
+GRAD_CLIP_MAX_NORM = 1.0
+
+# Параметры для MixUp/CutMix
+MIXUP_ALPHA = 0.4
+CUTMIX_ALPHA = 1.0
+
+
+# =========================
+# UTILS
+# =========================
+def seed_everything(seed: int = 42) -> None:
+    """Устанавливает случайные сиды для воспроизводимости экспериментов."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def find_image_for_stem(images_dir: Path, stem: str) -> Path | None:
+    """Ищет файл изображения по имени (stem) с различными расширениями."""
+    for ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]:
+        p = images_dir / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-7) -> float:
+    """Вычисляет Dice score между предсказанными логитами и целевыми масками."""
+    probs = torch.sigmoid(logits)
+    preds = (probs > THRESHOLD).float()
+
+    preds = preds.view(preds.size(0), -1)
+    targets = targets.view(targets.size(0), -1)
+
+    intersection = (preds * targets).sum(dim=1)
+    denom = preds.sum(dim=1) + targets.sum(dim=1)
+
+    dice = (2.0 * intersection + eps) / (denom + eps)
+    return dice.mean().item()
+
+
+def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-7) -> float:
+    """Вычисляет IoU score между предсказанными логитами и целевыми масками."""
+    probs = torch.sigmoid(logits)
+    preds = (probs > THRESHOLD).float()
+
+    preds = preds.view(preds.size(0), -1)
+    targets = targets.view(targets.size(0), -1)
+
+    intersection = (preds * targets).sum(dim=1)
+    union = preds.sum(dim=1) + targets.sum(dim=1) - intersection
+
+    iou = (intersection + eps) / (union + eps)
+    return iou.mean().item()
+
+
+# =========================
+# AUGMENTATIONS
+# =========================
+def get_train_transforms(img_size: int = 352) -> A.Compose:
+    """Создаёт pipeline аугментаций для обучения с учётом специфики товаров на кассе."""
+    return A.Compose(
+        [
+            # Геометрические трансформации
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),  # Товары могут лежать перевёрнутыми
+            A.RandomRotate90(p=0.5),
+            A.Rotate(limit=45, p=0.5, border_mode=cv2.BORDER_CONSTANT),
+            A.Affine(
+                scale=(0.8, 1.2),  # Разный размер товаров
+                translate_percent=(-0.1, 0.1),
+                rotate=(-15, 15),
+                shear=(-10, 10),
+                p=0.5,
+            ),
+            A.ElasticTransform(
+                alpha=50,
+                sigma=24 * 0.1,
+                alpha_affine=24 * 0.1,
+                p=0.3,
+            ),
+
+            # Оптические искажения
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+            A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.3),
+
+            # Размытие (движение товаров)
+            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+            A.MotionBlur(blur_limit=7, p=0.3),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),
+
+            # Морфологические операции
+            A.OneOf(
+                [
+                    A.Sharpen(p=1.0),
+                    A.Emboss(p=1.0),
+                    A.CLAHE(clip_limit=4.0, p=1.0),
+                ],
+                p=0.3,
+            ),
+
+            # Random Scale
+            A.RandomScale(scale_limit=(-0.2, 0.2), p=0.5),
+
+            # Приведение к размеру
+            A.Resize(height=img_size, width=img_size),
+
+            # Нормализация (будет применена после, но добавим для полноты)
+            A.Normalize(mean=(0, 0, 0), std=(1, 1, 1)),
+            ToTensorV2(),
+        ],
+        is_check_shapes=False,
+    )
+
+
+def get_val_transforms(img_size: int = 352) -> A.Compose:
+    """Создаёт pipeline аугментаций для валидации (только ресайз и нормализация)."""
+    return A.Compose(
+        [
+            A.Resize(height=img_size, width=img_size),
+            A.Normalize(mean=(0, 0, 0), std=(1, 1, 1)),
+            ToTensorV2(),
+        ],
+        is_check_shapes=False,
+    )
+
+
+# =========================
+# DATASET
+# =========================
+class BinarySegDataset(Dataset):
+    """Dataset для бинарной сегментации с поддержкой Albumentations и кастомных тензорных аугментаций."""
+
+    def __init__(
+        self,
+        images_dir: Path,
+        masks_dir: Path,
+        img_size: int = 352,
+        encoder_name: str = "resnet34",
+        encoder_weights: str | None = "imagenet",
+        augmentations: A.Compose | None = None,
+        samples: list | None = None, # <--- ДОБАВИЛИ ЭТОТ АРГУМЕНТ
+    ):
+        self.images_dir = Path(images_dir)
+        self.masks_dir = Path(masks_dir)
+        self.img_size = img_size
+        self.augmentations = augmentations
+        self.custom_augs = None 
+
+        self.preprocess_input = None
+        if encoder_weights is not None:
+            self.preprocess_input = get_preprocessing_fn(encoder_name, pretrained=encoder_weights)
+
+        # Если сэмплы переданы готовым списком - используем их
+        if samples is not None:
+            self.samples = samples
+        else:
+            # Иначе собираем сами
+            self.samples = []
+            for mask_path in sorted(self.masks_dir.glob("*.png")):
+                stem = mask_path.stem
+                image_path = find_image_for_stem(self.images_dir, stem)
+                if image_path is not None:
+                    self.samples.append((image_path, mask_path))
+
+        if not self.samples:
+            raise RuntimeError(f"No paired image/mask samples found")
+
+        # Выводим количество именно в ЭТОМ датасете
+        print(f"Dataset initialized with {len(self.samples)} samples")
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _get_single_sample(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Вспомогательный метод: загружает 1 картинку, применяет Albumentations и возвращает тензоры."""
+        image_path, mask_path = self.samples[idx]
+
+        image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        mask = (mask > 0).astype(np.uint8)
+
+        if self.augmentations is not None:
+            transformed = self.augmentations(image=image_rgb, mask=mask)
+            image_rgb = transformed["image"]
+            mask = transformed["mask"]
+
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            # Переводим во float, так как MixUp/CutMix работают с дробными весами
+            mask = mask.float()
+
+        else:
+            image_rgb = cv2.resize(image_rgb, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            image_rgb = image_rgb.astype(np.float32)
+
+            if self.preprocess_input is not None:
+                image_rgb = self.preprocess_input(image_rgb)
+            else:
+                image_rgb = image_rgb / 255.0
+
+            mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+            mask = mask.astype(np.float32)
+
+            image_rgb = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float()
+            mask = torch.from_numpy(mask[None, ...]).float()
+
+        return image_rgb, mask
+
+    def __getitem__(self, idx: int):
+        image_rgb, mask = self._get_single_sample(idx)
+
+        if self.custom_augs is not None:
+            # Выбираем случайную вторую картинку для MixUp/CutMix
+            random_idx = random.randint(0, len(self.samples) - 1)
+            source_image, source_mask = self._get_single_sample(random_idx)
+
+            # Применяем аугментации к тензорам
+            image_rgb, mask = self.custom_augs(
+                image=image_rgb, 
+                mask=mask, 
+                source_image=source_image, 
+                source_mask=source_mask
+            )
+
+        return image_rgb, mask
+
+
+# =========================
+# MODEL
+# =========================
+def build_model() -> nn.Module:
+    """Создаёт модель сегментации на основе конфигурации."""
+    if MODEL_NAME == "Unet":
+        model = smp.Unet(
+            encoder_name=ENCODER_NAME,
+            encoder_weights=ENCODER_WEIGHTS,
+            in_channels=3,
+            classes=1,
+            activation=None,
+        )
+    elif MODEL_NAME == "UnetPlusPlus":
+        model = smp.UnetPlusPlus(
+            encoder_name=ENCODER_NAME,
+            encoder_weights=ENCODER_WEIGHTS,
+            in_channels=3,
+            classes=1,
+            activation=None,
+        )
+    elif MODEL_NAME == "FPN":
+        model = smp.FPN(
+            encoder_name=ENCODER_NAME,
+            encoder_weights=ENCODER_WEIGHTS,
+            in_channels=3,
+            classes=1,
+            activation=None,
+        )
+    elif MODEL_NAME == "DeepLabV3Plus":
+        model = smp.DeepLabV3Plus(
+            encoder_name=ENCODER_NAME,
+            encoder_weights=ENCODER_WEIGHTS,
+            in_channels=3,
+            classes=1,
+            activation=None,
+        )
+    else:
+        raise ValueError(f"Unsupported MODEL_NAME: {MODEL_NAME}")
+    return model
+
+
+# =========================
+# LOSS FUNCTIONS
+# =========================
+class CombinedLoss(nn.Module):
+    """Комбинированный лосс: DiceLoss + BCEWithLogitsLoss с весовыми коэффициентами."""
+
+    def __init__(self, dice_weight: float = 0.5, bce_weight: float = 0.5):
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+        self.dice_loss = smp.losses.DiceLoss(mode=smp.losses.BINARY_MODE, from_logits=True)
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Вычисляет взвешенную сумму Dice и BCE лоссов."""
+        dice = self.dice_loss(logits, targets)
+        bce = self.bce_loss(logits, targets)
+        return self.dice_weight * dice + self.bce_weight * bce
+
+
+# =========================
+# TRAIN / VAL LOOPS
+# =========================
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    loss_fn,
+    device,
+    epoch,
+    num_epochs,
+    grad_scaler,
+):
+    """Обучает модель одну эпоху с поддержкой AMP и MixUp/CutMix."""
+    model.train()
+
+    running_loss = 0.0
+    running_dice = 0.0
+    running_iou = 0.0
+
+    pbar = tqdm(loader, desc=f"Train", leave=False)
+
+    for images, masks in pbar:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # AMP: автоматическое смешанное точность
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits = model(images)
+            loss = loss_fn(logits, masks)
+
+        # AMP: масштабирование градиентов
+        grad_scaler.scale(loss).backward()
+
+        # Gradient clipping
+        grad_scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+
+        # AMP: шаг оптимизатора
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
+
+        # Вычисление метрик (в float точности)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits_float = logits.float()
+            masks_float = masks.float()
+            batch_loss = loss_fn(logits_float, masks_float).item()
+            batch_dice = dice_score_from_logits(logits_float.detach(), masks_float)
+            batch_iou = iou_score_from_logits(logits_float.detach(), masks_float)
+
+        running_loss += batch_loss
+        running_dice += batch_dice
+        running_iou += batch_iou
+
+        pbar.set_postfix(loss=f"{batch_loss:.4f}", dice=f"{batch_dice:.4f}")
+
+    n = len(loader)
+    return {
+        "loss": running_loss / n,
+        "dice": running_dice / n,
+        "iou": running_iou / n,
+    }
+
+
+@torch.no_grad()
+def validate_one_epoch(model, loader, loss_fn, device, epoch, num_epochs):
+    """Валидирует модель одну эпоху без вычисления градиентов."""
+    model.eval()
+
+    running_loss = 0.0
+    running_dice = 0.0
+    running_iou = 0.0
+
+    pbar = tqdm(loader, desc=f"Val", leave=False)
+
+    for images, masks in pbar:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        # Валидация в float точности для стабильности
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits = model(images)
+            loss = loss_fn(logits, masks)
+
+        batch_loss = loss.item()
+        batch_dice = dice_score_from_logits(logits, masks)
+        batch_iou = iou_score_from_logits(logits, masks)
+
+        running_loss += batch_loss
+        running_dice += batch_dice
+        running_iou += batch_iou
+
+        pbar.set_postfix(loss=f"{batch_loss:.4f}", dice=f"{batch_dice:.4f}")
+
+    n = len(loader)
+    return {
+        "loss": running_loss / n,
+        "dice": running_dice / n,
+        "iou": running_iou / n,
+    }
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    """Запускает полный цикл обучения модели с улучшениями."""
+    seed_everything(SEED)
+
+    train_transforms = get_train_transforms(IMG_SIZE)
+    val_transforms = get_val_transforms(IMG_SIZE)
+
+    # Сначала просто собираем все пары файлов 
+    all_samples = []
+    for mask_path in sorted(MASKS_DIR.glob("*.png")):
+        stem = mask_path.stem
+        image_path = find_image_for_stem(IMAGES_DIR, stem)
+        if image_path is not None:
+            all_samples.append((image_path, mask_path))
+            
+    # Перемешиваем и делим списки файлов
+    random.Random(SEED).shuffle(all_samples)
+    val_size = int(len(all_samples) * VAL_RATIO)
+    
+    val_samples = all_samples[:val_size]
+    train_samples = all_samples[val_size:]
+    
+    print(f"Total: {len(all_samples)} | Train: {len(train_samples)} | Val: {len(val_samples)}")
+
+    train_dataset = BinarySegDataset(
+        images_dir=IMAGES_DIR,
+        masks_dir=MASKS_DIR,
+        img_size=IMG_SIZE,
+        encoder_name=ENCODER_NAME,
+        encoder_weights=ENCODER_WEIGHTS,
+        augmentations=train_transforms,
+        samples=train_samples # Передаем только тренировочные файлы
+    )
+
+    train_dataset.custom_augs = SegmentationAugmentations(
+        dataset_samples=train_samples,
+        mixup_alpha=0.4,
+        cutmix_alpha=1.0,
+        copypaste_max_objects=3,
+        apply_prob=0.5,
+        encoder_name=ENCODER_NAME,
+        encoder_weights=ENCODER_WEIGHTS,
+    )
+
+    val_dataset = BinarySegDataset(
+        images_dir=IMAGES_DIR,
+        masks_dir=MASKS_DIR,
+        img_size=IMG_SIZE,
+        encoder_name=ENCODER_NAME,
+        encoder_weights=ENCODER_WEIGHTS,
+        augmentations=val_transforms,
+        samples=val_samples # Передаем только валидационные файлы
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset, # <-- Здесь теперь val_dataset
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    model = build_model().to(DEVICE)
+
+    # Комбинированный лосс
+    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3
+    )
+
+    # AMP: GradScaler для mixed precision
+    grad_scaler = torch.amp.GradScaler()
+
+    best_val_dice = -1.0
+    history = []
+
+    # Early stopping
+    epochs_without_improvement = 0
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler
+        )
+        val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
+
+        # Scheduler шаг на основе val_dice
+        scheduler.step(val_metrics["dice"])
+
+        row = {
+            "epoch": epoch,
+            "lr": optimizer.param_groups[0]["lr"],
+            "train_loss": train_metrics["loss"],
+            "train_dice": train_metrics["dice"],
+            "train_iou": train_metrics["iou"],
+            "val_loss": val_metrics["loss"],
+            "val_dice": val_metrics["dice"],
+            "val_iou": val_metrics["iou"],
+        }
+        history.append(row)
+
+        print(
+            f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
+            f"train_loss={row['train_loss']:.4f} train_dice={row['train_dice']:.4f} train_iou={row['train_iou']:.4f} | "
+            f"val_loss={row['val_loss']:.4f} val_dice={row['val_dice']:.4f} val_iou={row['val_iou']:.4f}"
+        )
+
+        # Сохранение last
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_dice": row["val_dice"],
+                "config": {
+                    "MODEL_NAME": MODEL_NAME,
+                    "ENCODER_NAME": ENCODER_NAME,
+                    "ENCODER_WEIGHTS": ENCODER_WEIGHTS,
+                    "IMG_SIZE": IMG_SIZE,
+                },
+            },
+            SAVE_DIR / "last.pth",
+        )
+
+        # Сохранение best и проверка early stopping
+        if row["val_dice"] > best_val_dice:
+            best_val_dice = row["val_dice"]
+            epochs_without_improvement = 0  # Сброс счётчика
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_dice": row["val_dice"],
+                    "config": {
+                        "MODEL_NAME": MODEL_NAME,
+                        "ENCODER_NAME": ENCODER_NAME,
+                        "ENCODER_WEIGHTS": ENCODER_WEIGHTS,
+                        "IMG_SIZE": IMG_SIZE,
+                    },
+                },
+                SAVE_DIR / "best.pth",
+            )
+            print(f"Saved new best model with val_dice={best_val_dice:.4f}")
+        else:
+            epochs_without_improvement += 1
+            print(f"No improvement for {epochs_without_improvement} epochs")
+
+        # Early stopping проверка
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping triggered after {epoch} epochs. Best val_dice={best_val_dice:.4f}")
+            break
+
+    # Сохранение истории
+    import pandas as pd
+
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(SAVE_DIR / "history.csv", index=False)
+    print(f"Training finished. Best val_dice={best_val_dice:.4f}")
+
+
+if __name__ == "__main__":
+    main()
