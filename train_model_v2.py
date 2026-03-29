@@ -30,9 +30,9 @@ SAVE_DIR = Path("./model_checkpoints")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Визуализация предсказаний
-VISUALIZATION_DIR = Path("./view_train_img/change4")
+VISUALIZATION_DIR = Path("./view_train_img")
 VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
-VISUALIZE_EVERY_N_EPOCHS = 1
+VISUALIZE_EVERY_N_EPOCHS = 4
 
 IMG_SIZE = 352
 BATCH_SIZE = 8
@@ -43,6 +43,9 @@ VAL_RATIO = 0.2
 NUM_WORKERS = 4
 SEED = 42
 THRESHOLD = 0.5
+
+USE_COORDINATES = True
+INPUT_CHANNELS = 5 if USE_COORDINATES else 3
 
 MODEL_NAME = "UnetPlusPlus"
 ENCODER_NAME = "timm-efficientnet-b0"
@@ -115,41 +118,41 @@ def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: floa
     return iou.mean().item()
 
 
-def visualize_batch(images: torch.Tensor, masks: torch.Tensor, logits: torch.Tensor, 
+def visualize_batch(images: torch.Tensor, masks: torch.Tensor, logits: torch.Tensor,
                     save_path: Path, epoch: int, num_samples: int = 4) -> None:
     """Сохраняет визуализацию предсказаний модели для батча."""
     import matplotlib.pyplot as plt
-    
+
     fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
     if num_samples == 1:
         axes = axes.reshape(1, -1)
-    
+
     probs = torch.sigmoid(logits)
     preds = (probs > THRESHOLD).float()
-    
+
     for i in range(min(num_samples, images.size(0))):
-        img = images[i].cpu().permute(1, 2, 0).numpy()
+        img = images[i][:3].cpu().permute(1, 2, 0).numpy()
         img = (img - img.min()) / (img.max() - img.min() + 1e-7)
-        
+
         mask = masks[i].squeeze().cpu().numpy()
         pred = preds[i].squeeze().cpu().numpy()
-        
+
         axes[i, 0].imshow(img)
         axes[i, 0].set_title("Image")
         axes[i, 0].axis("off")
-        
+
         axes[i, 1].imshow(mask, cmap="gray")
         axes[i, 1].set_title("Ground Truth")
         axes[i, 1].axis("off")
-        
+
         axes[i, 2].imshow(pred, cmap="gray")
         axes[i, 2].set_title(f"Prediction (Epoch {epoch})")
         axes[i, 2].axis("off")
-    
+
     plt.tight_layout()
     plt.savefig(save_path / f"epoch_{epoch:03d}.png", dpi=100)
-    fig.clf() 
-    plt.close(fig) 
+    fig.clf()
+    plt.close(fig)
 
 
 # =========================
@@ -218,6 +221,14 @@ def get_val_transforms(img_size: int = 352) -> A.Compose:
     )
 
 
+def create_coordinate_maps(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """Создаёт нормализованные координатные карты X и Y."""
+    x_coords = np.linspace(0, 1, width, dtype=np.float32)
+    y_coords = np.linspace(0, 1, height, dtype=np.float32)
+    x_map, y_map = np.meshgrid(x_coords, y_coords)
+    return x_map, y_map
+
+
 # =========================
 # DATASET
 # =========================
@@ -232,13 +243,15 @@ class BinarySegDataset(Dataset):
         encoder_name: str = "resnet34",
         encoder_weights: str | None = "imagenet",
         augmentations: A.Compose | None = None,
-        samples: list | None = None, 
+        samples: list | None = None,
+        use_coordinates: bool = False,
     ):
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
         self.img_size = img_size
         self.augmentations = augmentations
-        self.custom_augs = None 
+        self.custom_augs = None
+        self.use_coordinates = use_coordinates
 
         self.preprocess_input = None
         if encoder_weights is not None:
@@ -272,7 +285,7 @@ class BinarySegDataset(Dataset):
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         mask = (mask > 0).astype(np.uint8)
-        
+
         if self.augmentations is not None:
             transformed = self.augmentations(image=image_rgb, mask=mask)
             image_rgb = transformed["image"]
@@ -281,6 +294,14 @@ class BinarySegDataset(Dataset):
             if mask.ndim == 2:
                 mask = mask.unsqueeze(0)
             mask = mask.float()
+
+            # добавляем координатные каналы после аугментаций
+            if self.use_coordinates:
+                h, w = image_rgb.shape[1], image_rgb.shape[2]
+                x_map, y_map = create_coordinate_maps(h, w)
+                coords = np.stack([x_map, y_map], axis=0)
+                coords = torch.from_numpy(coords).float()
+                image_rgb = torch.cat([image_rgb, coords], dim=0)
 
         else:
             image_rgb = cv2.resize(image_rgb, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
@@ -295,6 +316,14 @@ class BinarySegDataset(Dataset):
             mask = mask.astype(np.float32)
 
             image_rgb = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float()
+            
+            # добавляем координатные каналы
+            if self.use_coordinates:
+                x_map, y_map = create_coordinate_maps(self.img_size, self.img_size)
+                coords = np.stack([x_map, y_map], axis=0)
+                coords = torch.from_numpy(coords).float()
+                image_rgb = torch.cat([image_rgb, coords], dim=0)
+            
             mask = torch.from_numpy(mask[None, ...]).float()
 
         return image_rgb, mask
@@ -325,7 +354,7 @@ def build_model() -> nn.Module:
         model = smp.Unet(
             encoder_name=ENCODER_NAME,
             encoder_weights=ENCODER_WEIGHTS,
-            in_channels=3,
+            in_channels=INPUT_CHANNELS,  
             classes=1,
             activation=None,
         )
@@ -333,7 +362,7 @@ def build_model() -> nn.Module:
         model = smp.UnetPlusPlus(
             encoder_name=ENCODER_NAME,
             encoder_weights=ENCODER_WEIGHTS,
-            in_channels=3,
+            in_channels=INPUT_CHANNELS, 
             classes=1,
             activation=None,
         )
@@ -341,7 +370,7 @@ def build_model() -> nn.Module:
         model = smp.FPN(
             encoder_name=ENCODER_NAME,
             encoder_weights=ENCODER_WEIGHTS,
-            in_channels=3,
+            in_channels=INPUT_CHANNELS,  
             classes=1,
             activation=None,
         )
@@ -349,7 +378,7 @@ def build_model() -> nn.Module:
         model = smp.DeepLabV3Plus(
             encoder_name=ENCODER_NAME,
             encoder_weights=ENCODER_WEIGHTS,
-            in_channels=3,
+            in_channels=INPUT_CHANNELS, 
             classes=1,
             activation=None,
         )
@@ -457,7 +486,7 @@ def train_one_epoch(
     running_loss = 0.0
     running_dice = 0.0
     running_iou = 0.0
-    
+
     saved_images = False
     saved_batch = None
 
@@ -491,7 +520,7 @@ def train_one_epoch(
         running_loss += batch_loss
         running_dice += batch_dice
         running_iou += batch_iou
-        
+
         if not saved_images and visualization_dir is not None and epoch % visualize_every_n == 0:
             saved_batch = (images.clone(), masks.clone(), logits_float.detach().clone())
             saved_images = True
@@ -584,7 +613,8 @@ def main():
         encoder_name=ENCODER_NAME,
         encoder_weights=ENCODER_WEIGHTS,
         augmentations=train_transforms,
-        samples=train_samples # Передаем только тренировочные файлы
+        samples=train_samples,
+        use_coordinates=USE_COORDINATES,  
     )
 
     train_dataset.custom_augs = SegmentationAugmentations(
@@ -604,7 +634,8 @@ def main():
         encoder_name=ENCODER_NAME,
         encoder_weights=ENCODER_WEIGHTS,
         augmentations=val_transforms,
-        samples=val_samples # Передаем только валидационные файлы
+        samples=val_samples,
+        use_coordinates=USE_COORDINATES,  
     )
 
     train_loader = DataLoader(
@@ -626,20 +657,17 @@ def main():
 
     model = build_model().to(DEVICE)
 
-    # Комбинированный лосс
-    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT, 
+    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT,
                            boundary_weight=BOUNDARY_WEIGHT)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
-    # AMP: GradScaler для mixed precision
     grad_scaler = torch.amp.GradScaler()
 
     best_val_dice = -1.0
     history = []
 
-    # Early stopping
     epochs_without_improvement = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -650,7 +678,6 @@ def main():
         )
         val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
 
-        # Scheduler шаг на основе val_dice
         scheduler.step()
 
         row = {
