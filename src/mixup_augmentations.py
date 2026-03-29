@@ -250,7 +250,8 @@ class SegmentationAugmentations:
         # Собираем доступные опции
         choices = ["copypaste"]
         if source_image is not None and source_mask is not None:
-            choices.extend(["mixup", "cutmix"])
+            # choices.extend(["mixup", "cutmix"])
+            choices.extend(["cutmix"])
 
         # Выбираем строго ОДНУ аугментацию
         aug_choice = random.choice(choices)

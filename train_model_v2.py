@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.encoders import get_preprocessing_fn
@@ -28,6 +29,11 @@ MASKS_DIR = DATA_ROOT / "masks"
 SAVE_DIR = Path("./model_checkpoints")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Визуализация предсказаний
+VISUALIZATION_DIR = Path("./view_train_img/change4")
+VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
+VISUALIZE_EVERY_N_EPOCHS = 1
+
 IMG_SIZE = 352
 BATCH_SIZE = 8
 NUM_EPOCHS = 15
@@ -46,7 +52,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Параметры для комбинированного лосса
 DICE_WEIGHT = 0.5
-BCE_WEIGHT = 0.5
+BCE_WEIGHT = 0.3
+BOUNDARY_WEIGHT = 0.2
 
 # Параметры для early stopping
 EARLY_STOPPING_PATIENCE = 5
@@ -55,7 +62,6 @@ EARLY_STOPPING_PATIENCE = 5
 GRAD_CLIP_MAX_NORM = 1.0
 
 # Параметры для MixUp/CutMix
-MIXUP_ALPHA = 0.4
 CUTMIX_ALPHA = 1.0
 
 
@@ -109,6 +115,43 @@ def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: floa
     return iou.mean().item()
 
 
+def visualize_batch(images: torch.Tensor, masks: torch.Tensor, logits: torch.Tensor, 
+                    save_path: Path, epoch: int, num_samples: int = 4) -> None:
+    """Сохраняет визуализацию предсказаний модели для батча."""
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+    
+    probs = torch.sigmoid(logits)
+    preds = (probs > THRESHOLD).float()
+    
+    for i in range(min(num_samples, images.size(0))):
+        img = images[i].cpu().permute(1, 2, 0).numpy()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-7)
+        
+        mask = masks[i].squeeze().cpu().numpy()
+        pred = preds[i].squeeze().cpu().numpy()
+        
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title("Image")
+        axes[i, 0].axis("off")
+        
+        axes[i, 1].imshow(mask, cmap="gray")
+        axes[i, 1].set_title("Ground Truth")
+        axes[i, 1].axis("off")
+        
+        axes[i, 2].imshow(pred, cmap="gray")
+        axes[i, 2].set_title(f"Prediction (Epoch {epoch})")
+        axes[i, 2].axis("off")
+    
+    plt.tight_layout()
+    plt.savefig(save_path / f"epoch_{epoch:03d}.png", dpi=100)
+    fig.clf() 
+    plt.close(fig) 
+
+
 # =========================
 # AUGMENTATIONS
 # =========================
@@ -118,26 +161,20 @@ def get_train_transforms(img_size: int = 352) -> A.Compose:
         [
             # Геометрические трансформации
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.3),  # Товары могут лежать перевёрнутыми
+            A.VerticalFlip(p=0.3),  
             A.RandomRotate90(p=0.5),
             A.Rotate(limit=45, p=0.5, border_mode=cv2.BORDER_CONSTANT),
             A.Affine(
-                scale=(0.8, 1.2),  # Разный размер товаров
+                scale=(0.8, 1.2), 
                 translate_percent=(-0.1, 0.1),
                 rotate=(-15, 15),
                 shear=(-10, 10),
                 p=0.5,
             ),
-            A.ElasticTransform(
-                alpha=50,
-                sigma=24 * 0.1,
-                alpha_affine=24 * 0.1,
-                p=0.3,
-            ),
 
             # Оптические искажения
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.3),
             A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.3),
 
             # Размытие (движение товаров)
@@ -150,7 +187,6 @@ def get_train_transforms(img_size: int = 352) -> A.Compose:
             A.OneOf(
                 [
                     A.Sharpen(p=1.0),
-                    A.Emboss(p=1.0),
                     A.CLAHE(clip_limit=4.0, p=1.0),
                 ],
                 p=0.3,
@@ -196,7 +232,7 @@ class BinarySegDataset(Dataset):
         encoder_name: str = "resnet34",
         encoder_weights: str | None = "imagenet",
         augmentations: A.Compose | None = None,
-        samples: list | None = None, # <--- ДОБАВИЛИ ЭТОТ АРГУМЕНТ
+        samples: list | None = None, 
     ):
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
@@ -223,7 +259,6 @@ class BinarySegDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f"No paired image/mask samples found")
 
-        # Выводим количество именно в ЭТОМ датасете
         print(f"Dataset initialized with {len(self.samples)} samples")
     def __len__(self) -> int:
         return len(self.samples)
@@ -237,7 +272,7 @@ class BinarySegDataset(Dataset):
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         mask = (mask > 0).astype(np.uint8)
-
+        
         if self.augmentations is not None:
             transformed = self.augmentations(image=image_rgb, mask=mask)
             image_rgb = transformed["image"]
@@ -245,7 +280,6 @@ class BinarySegDataset(Dataset):
 
             if mask.ndim == 2:
                 mask = mask.unsqueeze(0)
-            # Переводим во float, так как MixUp/CutMix работают с дробными весами
             mask = mask.float()
 
         else:
@@ -269,11 +303,9 @@ class BinarySegDataset(Dataset):
         image_rgb, mask = self._get_single_sample(idx)
 
         if self.custom_augs is not None:
-            # Выбираем случайную вторую картинку для MixUp/CutMix
             random_idx = random.randint(0, len(self.samples) - 1)
             source_image, source_mask = self._get_single_sample(random_idx)
 
-            # Применяем аугментации к тензорам
             image_rgb, mask = self.custom_augs(
                 image=image_rgb, 
                 mask=mask, 
@@ -329,21 +361,79 @@ def build_model() -> nn.Module:
 # =========================
 # LOSS FUNCTIONS
 # =========================
-class CombinedLoss(nn.Module):
-    """Комбинированный лосс: DiceLoss + BCEWithLogitsLoss с весовыми коэффициентами."""
+class FocalTverskyLoss(nn.Module):
+    """Focal Tversky Loss — обобщение Dice с фокусировкой на сложных примерах."""
 
-    def __init__(self, dice_weight: float = 0.5, bce_weight: float = 0.5):
+    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75):
+        super().__init__()
+        self.alpha = alpha  # вес для False Positive
+        self.beta = beta    # вес для False Negative
+        self.gamma = gamma  # параметр фокусировки
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Вычисляет Focal Tversky Loss между логитами и масками."""
+        probs = torch.sigmoid(logits)
+        p0 = probs
+        p1 = 1 - probs
+
+        TP = (p1 * targets).sum()
+        FP = (p1 * (1 - targets)).sum()
+        FN = (p0 * targets).sum()
+
+        tversky = (TP + 1e-7) / (TP + self.alpha * FP + self.beta * FN + 1e-7)
+        return torch.pow(1 - tversky, self.gamma)
+
+
+class BoundaryLoss(nn.Module):
+    """Boundary Loss — штрафует ошибки на границах объектов через Sobel-фильтр."""
+
+    def __init__(self, sigma: float = 2):
+        super().__init__()
+        self.sigma = sigma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Вычисляет Boundary Dice Loss, выделяя границы через Sobel-оператор."""
+        probs = torch.sigmoid(logits)
+        
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                               device=probs.device).view(1, 1, 3, 3).float()
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                               device=probs.device).view(1, 1, 3, 3).float()
+
+        pred_edge = F.conv2d(probs, sobel_x, padding=1).abs() + \
+                    F.conv2d(probs, sobel_y, padding=1).abs()
+        target_edge = F.conv2d(targets, sobel_x, padding=1).abs() + \
+                      F.conv2d(targets, sobel_y, padding=1).abs()
+
+        inter = (pred_edge * target_edge).sum()
+        union = pred_edge.sum() + target_edge.sum()
+        return 1 - (2 * inter + 1e-7) / (union + 1e-7)
+
+
+class CombinedLoss(nn.Module):
+    """Комбинированный лосс: Dice + BCE + FocalTversky + Boundary с весовыми коэффициентами."""
+
+    def __init__(self, dice_weight: float = 0.5, bce_weight: float = 0.3, 
+                 boundary_weight: float = 0.2):
         super().__init__()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
+        self.boundary_weight = boundary_weight
         self.dice_loss = smp.losses.DiceLoss(mode=smp.losses.BINARY_MODE, from_logits=True)
         self.bce_loss = nn.BCEWithLogitsLoss()
+        self.focal_tversky = FocalTverskyLoss()
+        self.boundary_loss = BoundaryLoss()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Вычисляет взвешенную сумму Dice и BCE лоссов."""
+        """Вычисляет взвешенную сумму Dice, BCE, FocalTversky и Boundary лоссов."""
         dice = self.dice_loss(logits, targets)
         bce = self.bce_loss(logits, targets)
-        return self.dice_weight * dice + self.bce_weight * bce
+        focal_tversky = self.focal_tversky(logits, targets)
+        boundary = self.boundary_loss(logits, targets)
+        
+        return (self.dice_weight * dice + 
+                self.bce_weight * bce + 
+                self.boundary_weight * (focal_tversky + boundary))
 
 
 # =========================
@@ -358,6 +448,8 @@ def train_one_epoch(
     epoch,
     num_epochs,
     grad_scaler,
+    visualization_dir: Path | None = None,
+    visualize_every_n: int = 1,
 ):
     """Обучает модель одну эпоху с поддержкой AMP и MixUp/CutMix."""
     model.train()
@@ -365,51 +457,59 @@ def train_one_epoch(
     running_loss = 0.0
     running_dice = 0.0
     running_iou = 0.0
+    
+    saved_images = False
+    saved_batch = None
 
     pbar = tqdm(loader, desc=f"Train", leave=False)
 
-    for images, masks in pbar:
+    for i, (images, masks) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # AMP: автоматическое смешанное точность
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
             loss = loss_fn(logits, masks)
 
-        # AMP: масштабирование градиентов
         grad_scaler.scale(loss).backward()
 
-        # Gradient clipping
         grad_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
 
-        # AMP: шаг оптимизатора
         grad_scaler.step(optimizer)
         grad_scaler.update()
 
-        # Вычисление метрик (в float точности)
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             logits_float = logits.float()
             masks_float = masks.float()
-            batch_loss = loss_fn(logits_float, masks_float).item()
+            batch_loss = loss.item()
             batch_dice = dice_score_from_logits(logits_float.detach(), masks_float)
             batch_iou = iou_score_from_logits(logits_float.detach(), masks_float)
 
         running_loss += batch_loss
         running_dice += batch_dice
         running_iou += batch_iou
+        
+        if not saved_images and visualization_dir is not None and epoch % visualize_every_n == 0:
+            saved_batch = (images.clone(), masks.clone(), logits_float.detach().clone())
+            saved_images = True
 
         pbar.set_postfix(loss=f"{batch_loss:.4f}", dice=f"{batch_dice:.4f}")
 
     n = len(loader)
-    return {
+    metrics = {
         "loss": running_loss / n,
         "dice": running_dice / n,
         "iou": running_iou / n,
     }
+    
+    if saved_batch is not None and visualization_dir is not None and epoch % visualize_every_n == 0:
+        imgs, msks, lgts = saved_batch
+        visualize_batch(imgs, msks, lgts, visualization_dir, epoch, num_samples=4)
+
+    return metrics
 
 
 @torch.no_grad()
@@ -427,14 +527,14 @@ def validate_one_epoch(model, loader, loss_fn, device, epoch, num_epochs):
         images = images.to(device)
         masks = masks.to(device)
 
-        # Валидация в float точности для стабильности
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
             loss = loss_fn(logits, masks)
 
+        logits_float = logits.float()
         batch_loss = loss.item()
-        batch_dice = dice_score_from_logits(logits, masks)
-        batch_iou = iou_score_from_logits(logits, masks)
+        batch_dice = dice_score_from_logits(logits_float, masks)
+        batch_iou = iou_score_from_logits(logits_float, masks)
 
         running_loss += batch_loss
         running_dice += batch_dice
@@ -516,7 +616,7 @@ def main():
         drop_last=False,
     )
     val_loader = DataLoader(
-        val_dataset, # <-- Здесь теперь val_dataset
+        val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
@@ -527,12 +627,11 @@ def main():
     model = build_model().to(DEVICE)
 
     # Комбинированный лосс
-    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT)
+    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT, 
+                           boundary_weight=BOUNDARY_WEIGHT)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     # AMP: GradScaler для mixed precision
     grad_scaler = torch.amp.GradScaler()
@@ -545,12 +644,14 @@ def main():
 
     for epoch in range(1, NUM_EPOCHS + 1):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler
+            model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler,
+            visualization_dir=VISUALIZATION_DIR,
+            visualize_every_n=VISUALIZE_EVERY_N_EPOCHS,
         )
         val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
 
         # Scheduler шаг на основе val_dice
-        scheduler.step(val_metrics["dice"])
+        scheduler.step()
 
         row = {
             "epoch": epoch,

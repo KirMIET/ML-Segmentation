@@ -9,3 +9,4 @@ seg_train_runs/
 *.csv
 changes/
 model_checkpoints/
+view_train_img/
