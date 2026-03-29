@@ -67,6 +67,77 @@ GRAD_CLIP_MAX_NORM = 1.0
 # Параметры для MixUp/CutMix
 CUTMIX_ALPHA = 1.0
 
+# !!! ИЗМЕНЕНИЕ SAM: параметры Sharpness-Aware Minimization
+USE_SAM = True
+SAM_RHO = 0.02  # Уменьшенное значение для стабильности
+
+
+# =========================
+# SAM OPTIMIZER
+# =========================
+# !!! ИЗМЕНЕНИЕ SAM: класс Sharpness-Aware Minimization
+class SAM:
+    """SAM optimizer wrapper над базовым оптимизатором, совместимый с AMP GradScaler."""
+
+    def __init__(self, base_optimizer: torch.optim.Optimizer, rho: float = 0.05):
+        self.rho = rho
+        self.base_optimizer = base_optimizer
+
+    @torch.no_grad()
+    def perturb(self, inv_scale: float = 1.0) -> bool:
+        """Первый шаг: вычисляет возмущение. Возвращает False, если градиенты невалидны (Inf/NaN)."""
+        grads = []
+        for group in self.base_optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    grads.append(p.grad)
+        
+        if not grads:
+            return True
+
+        # Вычисляем L2 норму градиентов
+        grad_norm = torch.norm(
+            torch.stack([torch.norm(g, p=2) for g in grads]),
+            p=2
+        )
+
+        # Переводим норму в истинный масштаб (убираем влияние GradScaler)
+        true_grad_norm = grad_norm * inv_scale
+
+        # Защита от NaN/Inf (если GradScaler взял слишком большой масштаб)
+        if not torch.isfinite(true_grad_norm) or true_grad_norm == 0:
+            return False
+
+        scale = self.rho / (true_grad_norm + 1e-12)
+
+        for group in self.base_optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                # Истинный градиент = (p.grad * inv_scale)
+                e_w = (p.grad * inv_scale) * scale
+                p.add_(e_w)
+                p.__dict__['e_w'] = e_w
+                
+        return True
+
+    @torch.no_grad()
+    def unperturb(self) -> None:
+        """Откатывает возмущение."""
+        for group in self.base_optimizer.param_groups:
+            for p in group['params']:
+                if 'e_w' not in p.__dict__:
+                    continue
+                p.sub_(p.__dict__['e_w'])
+                del p.__dict__['e_w']
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.base_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self) -> None:
+        """Применяет обновление базового оптимизатора."""
+        self.base_optimizer.step()
+
 
 # =========================
 # UTILS
@@ -479,6 +550,7 @@ def train_one_epoch(
     grad_scaler,
     visualization_dir: Path | None = None,
     visualize_every_n: int = 1,
+    use_sam: bool = False,
 ):
     """Обучает модель одну эпоху с поддержкой AMP и MixUp/CutMix."""
     model.train()
@@ -496,24 +568,69 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        if use_sam:
+            # === ПЕРВЫЙ ПРОХОД ===
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                logits = model(images)
+                loss = loss_fn(logits, masks)
+            grad_scaler.scale(loss).backward()
+            
+            # Узнаем текущий множитель GradScaler
+            inv_scale = 1.0 / grad_scaler.get_scale()
+            
+            # Делаем perturb с учетом масштаба.
+            is_finite = optimizer.perturb(inv_scale)
+            
+            if not is_finite:
+                # ИСПРАВЛЕНИЕ ЗДЕСЬ:
+                # 1. Явно показываем скейлеру NaN-градиенты (НЕ очищаем их до этого!)
+                grad_scaler.unscale_(optimizer.base_optimizer)
+                # 2. Делаем шаг. Скейлер увидит NaN и безопасно пропустит обновление весов модели
+                grad_scaler.step(optimizer.base_optimizer) 
+                # 3. Обновляем scale (он УМЕНЬШИТСЯ, чтобы в след. раз не было NaN)
+                grad_scaler.update()
+                # 4. И только теперь очищаем мусорные градиенты перед переходом к следующему батчу
+                optimizer.zero_grad(set_to_none=True)
+                continue  
+
+            # === ВТОРОЙ ПРОХОД (в возмущенной точке) ===
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                logits_perturbed = model(images)
+                loss_perturbed = loss_fn(logits_perturbed, masks)
+            grad_scaler.scale(loss_perturbed).backward()
+
+            # Откат возмущения
+            optimizer.unperturb()
+            
+            # === ШАГ ОПТИМИЗАТОРА ===
+            # Правильно снимаем масштаб перед клиппингом градиентов
+            grad_scaler.unscale_(optimizer.base_optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+            
+            grad_scaler.step(optimizer.base_optimizer)
+            grad_scaler.update()
+
+            final_loss = loss_perturbed
+            final_logits = logits_perturbed
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                logits = model(images)
+                loss = loss_fn(logits, masks)
+            grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            final_loss = loss
+            final_logits = logits
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            logits = model(images)
-            loss = loss_fn(logits, masks)
-
-        grad_scaler.scale(loss).backward()
-
-        grad_scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
-
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            logits_float = logits.float()
+            logits_float = final_logits.float()
             masks_float = masks.float()
-            batch_loss = loss.item()
+            batch_loss = final_loss.item()
             batch_dice = dice_score_from_logits(logits_float.detach(), masks_float)
             batch_iou = iou_score_from_logits(logits_float.detach(), masks_float)
 
@@ -660,8 +777,12 @@ def main():
     loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT,
                            boundary_weight=BOUNDARY_WEIGHT)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    # !!! ИЗМЕНЕНИЕ SAM: оборачиваем оптимизатор в SAM если включено
+    base_optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = SAM(base_optimizer, rho=SAM_RHO) if USE_SAM else base_optimizer
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer.base_optimizer if USE_SAM else optimizer, T_max=NUM_EPOCHS
+    )
 
     grad_scaler = torch.amp.GradScaler()
 
@@ -675,6 +796,7 @@ def main():
             model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler,
             visualization_dir=VISUALIZATION_DIR,
             visualize_every_n=VISUALIZE_EVERY_N_EPOCHS,
+            use_sam=USE_SAM,  # !!! ИЗМЕНЕНИЕ SAM: передаём флаг SAM
         )
         val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
 
@@ -682,7 +804,7 @@ def main():
 
         row = {
             "epoch": epoch,
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": optimizer.base_optimizer.param_groups[0]["lr"] if USE_SAM else optimizer.param_groups[0]["lr"],
             "train_loss": train_metrics["loss"],
             "train_dice": train_metrics["dice"],
             "train_iou": train_metrics["iou"],
@@ -699,11 +821,13 @@ def main():
         )
 
         # Сохранение last
+        # !!! ИЗМЕНЕНИЕ SAM: сохраняем state_dict базового оптимизатора
+        optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
         torch.save(
             {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+                "optimizer_state_dict": optimizer_to_save.state_dict(),
                 "val_dice": row["val_dice"],
                 "config": {
                     "MODEL_NAME": MODEL_NAME,
@@ -719,11 +843,13 @@ def main():
         if row["val_dice"] > best_val_dice:
             best_val_dice = row["val_dice"]
             epochs_without_improvement = 0  # Сброс счётчика
+            # !!! ИЗМЕНЕНИЕ SAM: сохраняем state_dict базового оптимизатора
+            optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
+                    "optimizer_state_dict": optimizer_to_save.state_dict(),
                     "val_dice": row["val_dice"],
                     "config": {
                         "MODEL_NAME": MODEL_NAME,
