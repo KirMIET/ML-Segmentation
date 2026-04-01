@@ -35,8 +35,12 @@ VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
 VISUALIZE_EVERY_N_EPOCHS = 1
 
 IMG_SIZE = 352
-BATCH_SIZE = 8
-NUM_EPOCHS = 15
+MULTI_SCALES = [256, 288, 352]
+BATCH_SIZE = 16
+
+NUM_EPOCHS = 20
+WARMUP_EPOCHS = 4
+
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 VAL_RATIO = 0.2
@@ -46,6 +50,10 @@ THRESHOLD = 0.5
 
 USE_COORDINATES = True
 INPUT_CHANNELS = 5 if USE_COORDINATES else 3
+
+# OHEM parameters
+USE_OHEM = True
+OHEM_RATIO = 0.25  # Keep top 25% hardest pixels
 
 MODEL_NAME = "UnetPlusPlus"
 ENCODER_NAME = "timm-efficientnet-b0"
@@ -66,7 +74,7 @@ CUTMIX_ALPHA = 1.0
 USE_SAM = True
 SAM_RHO = 0.02  
 
-WARMUP_EPOCHS = 3
+
 # =========================
 # SAM OPTIMIZER
 # =========================
@@ -219,55 +227,61 @@ def visualize_batch(images: torch.Tensor, masks: torch.Tensor, logits: torch.Ten
 # =========================
 # AUGMENTATIONS
 # =========================
-def get_train_transforms(img_size: int = 352) -> A.Compose:
-    """Создаёт pipeline аугментаций для обучения с учётом специфики товаров на кассе."""
-    return A.Compose(
-        [
-            # Геометрические трансформации
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.3),  
-            A.RandomRotate90(p=0.5),
-            A.Rotate(limit=45, p=0.5, border_mode=cv2.BORDER_CONSTANT),
-            A.Affine(
-                scale=(0.8, 1.2), 
-                translate_percent=(-0.1, 0.1),
-                rotate=(-15, 15),
-                shear=(-10, 10),
-                p=0.5,
-            ),
+def get_train_transforms(img_size: int | None = None) -> A.Compose:
+    """Создаёт pipeline аугментаций для обучения с учётом специфики товаров на кассе.
+    
+    Args:
+        img_size: Размер изображения. Если None, ресайз не применяется (для multi-scale).
+    """
+    transforms = [
+        # Геометрические трансформации
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.3),
+        A.RandomRotate90(p=0.5),
+        A.Rotate(limit=45, p=0.5, border_mode=cv2.BORDER_CONSTANT),
+        A.Affine(
+            scale=(0.8, 1.2),
+            translate_percent=(-0.1, 0.1),
+            rotate=(-15, 15),
+            shear=(-10, 10),
+            p=0.5,
+        ),
 
-            # Оптические искажения
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.3),
-            A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.3),
+        # Оптические искажения (уменьшены на 25%)
+        A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.3),
+        A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=22.5, val_shift_limit=15, p=0.3),
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.3),
 
-            # Размытие (движение товаров)
-            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-            A.MotionBlur(blur_limit=7, p=0.3),
-            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.3),
+        # Размытие (движение товаров)
+        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+        A.MotionBlur(blur_limit=7, p=0.3),
+        A.GaussNoise(var_limit=(7.5, 37.5), p=0.3),  # уменьшено на 25%
+        A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.075, 0.375), p=0.3),  # уменьшено на 25%
 
-            # Морфологические операции
-            A.OneOf(
-                [
-                    A.Sharpen(p=1.0),
-                    A.CLAHE(clip_limit=4.0, p=1.0),
-                ],
-                p=0.3,
-            ),
+        # Морфологические операции
+        A.OneOf(
+            [
+                A.Sharpen(p=1.0),
+                A.CLAHE(clip_limit=4.0, p=1.0),
+            ],
+            p=0.3,
+        ),
 
-            # Random Scale
-            A.RandomScale(scale_limit=(-0.2, 0.2), p=0.5),
+        # Random Scale
+        A.RandomScale(scale_limit=(-0.2, 0.2), p=0.5),
+    ]
 
-            # Приведение к размеру
-            A.Resize(height=img_size, width=img_size),
+    # Добавляем Resize только если указан размер
+    if img_size is not None:
+        transforms.append(A.Resize(height=img_size, width=img_size))
 
-            # Нормализация ImageNet
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ],
-        is_check_shapes=False,
-    )
+    # Нормализация ImageNet
+    transforms.extend([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+    return A.Compose(transforms, is_check_shapes=False)
 
 
 def get_val_transforms(img_size: int = 352) -> A.Compose:
@@ -287,7 +301,7 @@ def create_coordinate_maps(height: int, width: int) -> tuple[np.ndarray, np.ndar
     x_coords = np.linspace(0, 1, width, dtype=np.float32)
     y_coords = np.linspace(0, 1, height, dtype=np.float32)
     x_map, y_map = np.meshgrid(x_coords, y_coords)
-    return x_map, y_map
+    return x_map.copy(), y_map.copy()
 
 
 # =========================
@@ -334,6 +348,7 @@ class BinarySegDataset(Dataset):
             raise RuntimeError(f"No paired image/mask samples found")
 
         print(f"Dataset initialized with {len(self.samples)} samples")
+    
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -348,6 +363,10 @@ class BinarySegDataset(Dataset):
         mask = (mask > 0).astype(np.uint8)
 
         if self.augmentations is not None:
+            # Ресайзим изображение и маску перед применением аугментаций
+            image_rgb = cv2.resize(image_rgb, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+
             transformed = self.augmentations(image=image_rgb, mask=mask)
             image_rgb = transformed["image"]
             mask = transformed["mask"]
@@ -377,14 +396,14 @@ class BinarySegDataset(Dataset):
             mask = mask.astype(np.float32)
 
             image_rgb = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float()
-            
+
             # добавляем координатные каналы
             if self.use_coordinates:
                 x_map, y_map = create_coordinate_maps(self.img_size, self.img_size)
                 coords = np.stack([x_map, y_map], axis=0)
                 coords = torch.from_numpy(coords).float()
                 image_rgb = torch.cat([image_rgb, coords], dim=0)
-            
+
             mask = torch.from_numpy(mask[None, ...]).float()
 
         return image_rgb, mask
@@ -397,13 +416,13 @@ class BinarySegDataset(Dataset):
             source_image, source_mask = self._get_single_sample(random_idx)
 
             image_rgb, mask = self.custom_augs(
-                image=image_rgb, 
-                mask=mask, 
-                source_image=source_image, 
+                image=image_rgb,
+                mask=mask,
+                source_image=source_image,
                 source_mask=source_mask
             )
 
-        return image_rgb, mask
+        return image_rgb.contiguous(), mask.contiguous()
 
 
 # =========================
@@ -498,33 +517,68 @@ class BoundaryLoss(nn.Module):
         return 1 - (2 * inter + 1e-7) / (union + 1e-7)
 
 
-class CombinedLoss(nn.Module):
-    """Комбинированный лосс: BCE + FocalTversky + Boundary"""
+class OHEMBCEWithLogitsLoss(nn.Module):
+    """BCE Loss с OHEM """
 
-    def __init__(self, 
-                 bce_weight: float = 0.4, 
-                 tversky_weight: float = 0.5, 
-                 boundary_weight: float = 0.1):
+    def __init__(self, ohem_ratio: float = 0.25, min_kept: int = 10000):
+        super().__init__()
+        self.ohem_ratio = ohem_ratio
+        self.min_kept = min_kept 
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        loss_per_pixel = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+
+        loss_flat = loss_per_pixel.view(-1)
+
+        sorted_loss, _ = torch.sort(loss_flat, descending=True)
+
+        num_pixels = loss_flat.size(0)
+        num_kept = max(
+            int(num_pixels * self.ohem_ratio),
+            self.min_kept
+        )
+        num_kept = min(num_kept, num_pixels)
+
+        kept_loss = sorted_loss[:num_kept]
+
+        return kept_loss.mean()
+
+
+class CombinedLoss(nn.Module):
+    """Комбинированный лосс: BCE (с OHEM) + FocalTversky + Boundary"""
+
+    def __init__(self,
+                 bce_weight: float = 0.4,
+                 tversky_weight: float = 0.5,
+                 boundary_weight: float = 0.1,
+                 use_ohem: bool = True,
+                 ohem_ratio: float = 0.25):
         super().__init__()
         self.bce_weight = bce_weight
         self.tversky_weight = tversky_weight
         self.boundary_weight = boundary_weight
-        
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        
+
+        # BCE с OHEM или обычный
+        if use_ohem:
+            self.bce_loss = OHEMBCEWithLogitsLoss(ohem_ratio=ohem_ratio)
+        else:
+            self.bce_loss = nn.BCEWithLogitsLoss()
+
         # alpha=0.3 (штраф за FP - захват фона), beta=0.7 (штраф за FN - пропуск товара)
-        self.focal_tversky = FocalTverskyLoss(alpha=0.3, beta=0.7, gamma=0.75) 
+        self.focal_tversky = FocalTverskyLoss(alpha=0.3, beta=0.7, gamma=0.75)
         self.boundary_loss = BoundaryLoss()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         loss = 0.0
-        
+
         if self.bce_weight > 0:
             loss += self.bce_weight * self.bce_loss(logits, targets)
-            
+
         if self.tversky_weight > 0:
             loss += self.tversky_weight * self.focal_tversky(logits, targets)
-            
+
         if self.boundary_weight > 0:
             loss += self.boundary_weight * self.boundary_loss(logits, targets)
             
@@ -563,23 +617,28 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
+        new_size = random.choice(MULTI_SCALES)
+        if images.shape[-1] != new_size:
+            images = F.interpolate(images, size=(new_size, new_size), mode='bilinear', align_corners=False)
+            masks = F.interpolate(masks, size=(new_size, new_size), mode='nearest')
+
         if use_sam:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
             grad_scaler.scale(loss).backward()
-            
+
             inv_scale = 1.0 / grad_scaler.get_scale()
-            
+
             is_finite = optimizer.perturb(inv_scale)
-            
+
             if not is_finite:
                 grad_scaler.unscale_(optimizer.base_optimizer)
-                grad_scaler.step(optimizer.base_optimizer) 
+                grad_scaler.step(optimizer.base_optimizer)
                 grad_scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                continue  
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
@@ -588,10 +647,10 @@ def train_one_epoch(
             grad_scaler.scale(loss_perturbed).backward()
 
             optimizer.unperturb()
-            
+
             grad_scaler.unscale_(optimizer.base_optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
-            
+
             grad_scaler.step(optimizer.base_optimizer)
             grad_scaler.update()
 
@@ -686,24 +745,25 @@ def main():
     """Запускает полный цикл обучения модели с улучшениями."""
     seed_everything(SEED)
 
-    train_transforms = get_train_transforms(IMG_SIZE)
+    # Multi-scale training: для train_transforms не указываем размер (будет выбираться случайно)
+    train_transforms = get_train_transforms(img_size=IMG_SIZE)
     val_transforms = get_val_transforms(IMG_SIZE)
 
-    # Сначала просто собираем все пары файлов 
+    # Сначала просто собираем все пары файлов
     all_samples = []
     for mask_path in sorted(MASKS_DIR.glob("*.png")):
         stem = mask_path.stem
         image_path = find_image_for_stem(IMAGES_DIR, stem)
         if image_path is not None:
             all_samples.append((image_path, mask_path))
-            
+
     # Перемешиваем и делим списки файлов
     random.Random(SEED).shuffle(all_samples)
     val_size = int(len(all_samples) * VAL_RATIO)
-    
+
     val_samples = all_samples[:val_size]
     train_samples = all_samples[val_size:]
-    
+
     print(f"Total: {len(all_samples)} | Train: {len(train_samples)} | Val: {len(val_samples)}")
 
     train_dataset = BinarySegDataset(
@@ -714,7 +774,7 @@ def main():
         encoder_weights=ENCODER_WEIGHTS,
         augmentations=train_transforms,
         samples=train_samples,
-        use_coordinates=USE_COORDINATES,  
+        use_coordinates=USE_COORDINATES,
     )
 
     train_dataset.custom_augs = SegmentationAugmentations(
@@ -733,7 +793,7 @@ def main():
         encoder_weights=ENCODER_WEIGHTS,
         augmentations=val_transforms,
         samples=val_samples,
-        use_coordinates=USE_COORDINATES,  
+        use_coordinates=USE_COORDINATES,
     )
 
     train_loader = DataLoader(
@@ -756,9 +816,11 @@ def main():
     model = build_model().to(DEVICE)
 
     loss_fn = CombinedLoss(
-        bce_weight=0.4, 
-        tversky_weight=0.6, 
-        boundary_weight=0.0
+        bce_weight=0.4,
+        tversky_weight=0.6,
+        boundary_weight=0.0,
+        use_ohem=USE_OHEM,
+        ohem_ratio=OHEM_RATIO
     ).to(DEVICE)
 
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
