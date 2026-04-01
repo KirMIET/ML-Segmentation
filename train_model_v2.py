@@ -32,7 +32,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # Визуализация предсказаний
 VISUALIZATION_DIR = Path("./view_train_img")
 VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
-VISUALIZE_EVERY_N_EPOCHS = 4
+VISUALIZE_EVERY_N_EPOCHS = 1
 
 IMG_SIZE = 352
 BATCH_SIZE = 8
@@ -53,29 +53,23 @@ ENCODER_WEIGHTS = "noisy-student"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Параметры для комбинированного лосса
-DICE_WEIGHT = 0.5
-BCE_WEIGHT = 0.3
-BOUNDARY_WEIGHT = 0.2
-
 # Параметры для early stopping
 EARLY_STOPPING_PATIENCE = 5
 
 # Параметры для gradient clipping
 GRAD_CLIP_MAX_NORM = 1.0
 
-# Параметры для MixUp/CutMix
+# Параметры для CutMix
 CUTMIX_ALPHA = 1.0
 
-# !!! ИЗМЕНЕНИЕ SAM: параметры Sharpness-Aware Minimization
+# SAM
 USE_SAM = True
-SAM_RHO = 0.02  # Уменьшенное значение для стабильности
+SAM_RHO = 0.02  
 
-
+WARMUP_EPOCHS = 3
 # =========================
 # SAM OPTIMIZER
 # =========================
-# !!! ИЗМЕНЕНИЕ SAM: класс Sharpness-Aware Minimization
 class SAM:
     """SAM optimizer wrapper над базовым оптимизатором, совместимый с AMP GradScaler."""
 
@@ -95,16 +89,13 @@ class SAM:
         if not grads:
             return True
 
-        # Вычисляем L2 норму градиентов
         grad_norm = torch.norm(
             torch.stack([torch.norm(g, p=2) for g in grads]),
             p=2
         )
 
-        # Переводим норму в истинный масштаб (убираем влияние GradScaler)
         true_grad_norm = grad_norm * inv_scale
 
-        # Защита от NaN/Inf (если GradScaler взял слишком большой масштаб)
         if not torch.isfinite(true_grad_norm) or true_grad_norm == 0:
             return False
 
@@ -114,7 +105,6 @@ class SAM:
             for p in group['params']:
                 if p.grad is None:
                     continue
-                # Истинный градиент = (p.grad * inv_scale)
                 e_w = (p.grad * inv_scale) * scale
                 p.add_(e_w)
                 p.__dict__['e_w'] = e_w
@@ -272,8 +262,8 @@ def get_train_transforms(img_size: int = 352) -> A.Compose:
             # Приведение к размеру
             A.Resize(height=img_size, width=img_size),
 
-            # Нормализация (будет применена после, но добавим для полноты)
-            A.Normalize(mean=(0, 0, 0), std=(1, 1, 1)),
+            # Нормализация ImageNet
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ],
         is_check_shapes=False,
@@ -285,7 +275,7 @@ def get_val_transforms(img_size: int = 352) -> A.Compose:
     return A.Compose(
         [
             A.Resize(height=img_size, width=img_size),
-            A.Normalize(mean=(0, 0, 0), std=(1, 1, 1)),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ],
         is_check_shapes=False,
@@ -473,12 +463,10 @@ class FocalTverskyLoss(nn.Module):
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Вычисляет Focal Tversky Loss между логитами и масками."""
         probs = torch.sigmoid(logits)
-        p0 = probs
-        p1 = 1 - probs
 
-        TP = (p1 * targets).sum()
-        FP = (p1 * (1 - targets)).sum()
-        FN = (p0 * targets).sum()
+        TP = (probs * targets).sum()
+        FP = (probs * (1 - targets)).sum()
+        FN = ((1 - probs) * targets).sum()
 
         tversky = (TP + 1e-7) / (TP + self.alpha * FP + self.beta * FN + 1e-7)
         return torch.pow(1 - tversky, self.gamma)
@@ -493,7 +481,7 @@ class BoundaryLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Вычисляет Boundary Dice Loss, выделяя границы через Sobel-оператор."""
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits / 0.1)
         
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
                                device=probs.device).view(1, 1, 3, 3).float()
@@ -511,29 +499,36 @@ class BoundaryLoss(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-    """Комбинированный лосс: Dice + BCE + FocalTversky + Boundary с весовыми коэффициентами."""
+    """Комбинированный лосс: BCE + FocalTversky + Boundary"""
 
-    def __init__(self, dice_weight: float = 0.5, bce_weight: float = 0.3, 
-                 boundary_weight: float = 0.2):
+    def __init__(self, 
+                 bce_weight: float = 0.4, 
+                 tversky_weight: float = 0.5, 
+                 boundary_weight: float = 0.1):
         super().__init__()
-        self.dice_weight = dice_weight
         self.bce_weight = bce_weight
+        self.tversky_weight = tversky_weight
         self.boundary_weight = boundary_weight
-        self.dice_loss = smp.losses.DiceLoss(mode=smp.losses.BINARY_MODE, from_logits=True)
+        
         self.bce_loss = nn.BCEWithLogitsLoss()
-        self.focal_tversky = FocalTverskyLoss()
+        
+        # alpha=0.3 (штраф за FP - захват фона), beta=0.7 (штраф за FN - пропуск товара)
+        self.focal_tversky = FocalTverskyLoss(alpha=0.3, beta=0.7, gamma=0.75) 
         self.boundary_loss = BoundaryLoss()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Вычисляет взвешенную сумму Dice, BCE, FocalTversky и Boundary лоссов."""
-        dice = self.dice_loss(logits, targets)
-        bce = self.bce_loss(logits, targets)
-        focal_tversky = self.focal_tversky(logits, targets)
-        boundary = self.boundary_loss(logits, targets)
+        loss = 0.0
         
-        return (self.dice_weight * dice + 
-                self.bce_weight * bce + 
-                self.boundary_weight * (focal_tversky + boundary))
+        if self.bce_weight > 0:
+            loss += self.bce_weight * self.bce_loss(logits, targets)
+            
+        if self.tversky_weight > 0:
+            loss += self.tversky_weight * self.focal_tversky(logits, targets)
+            
+        if self.boundary_weight > 0:
+            loss += self.boundary_weight * self.boundary_loss(logits, targets)
+            
+        return loss
 
 
 # =========================
@@ -552,7 +547,7 @@ def train_one_epoch(
     visualize_every_n: int = 1,
     use_sam: bool = False,
 ):
-    """Обучает модель одну эпоху с поддержкой AMP и MixUp/CutMix."""
+    """Обучает модель одну эпоху с поддержкой AMP и CutMix."""
     model.train()
 
     running_loss = 0.0
@@ -569,43 +564,31 @@ def train_one_epoch(
         masks = masks.to(device, non_blocking=True)
 
         if use_sam:
-            # === ПЕРВЫЙ ПРОХОД ===
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits = model(images)
                 loss = loss_fn(logits, masks)
             grad_scaler.scale(loss).backward()
             
-            # Узнаем текущий множитель GradScaler
             inv_scale = 1.0 / grad_scaler.get_scale()
             
-            # Делаем perturb с учетом масштаба.
             is_finite = optimizer.perturb(inv_scale)
             
             if not is_finite:
-                # ИСПРАВЛЕНИЕ ЗДЕСЬ:
-                # 1. Явно показываем скейлеру NaN-градиенты (НЕ очищаем их до этого!)
                 grad_scaler.unscale_(optimizer.base_optimizer)
-                # 2. Делаем шаг. Скейлер увидит NaN и безопасно пропустит обновление весов модели
                 grad_scaler.step(optimizer.base_optimizer) 
-                # 3. Обновляем scale (он УМЕНЬШИТСЯ, чтобы в след. раз не было NaN)
                 grad_scaler.update()
-                # 4. И только теперь очищаем мусорные градиенты перед переходом к следующему батчу
                 optimizer.zero_grad(set_to_none=True)
                 continue  
 
-            # === ВТОРОЙ ПРОХОД (в возмущенной точке) ===
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits_perturbed = model(images)
                 loss_perturbed = loss_fn(logits_perturbed, masks)
             grad_scaler.scale(loss_perturbed).backward()
 
-            # Откат возмущения
             optimizer.unperturb()
             
-            # === ШАГ ОПТИМИЗАТОРА ===
-            # Правильно снимаем масштаб перед клиппингом градиентов
             grad_scaler.unscale_(optimizer.base_optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
             
@@ -740,8 +723,6 @@ def main():
         cutmix_alpha=1.0,
         copypaste_max_objects=3,
         apply_prob=0.5,
-        encoder_name=ENCODER_NAME,
-        encoder_weights=ENCODER_WEIGHTS,
     )
 
     val_dataset = BinarySegDataset(
@@ -774,10 +755,12 @@ def main():
 
     model = build_model().to(DEVICE)
 
-    loss_fn = CombinedLoss(dice_weight=DICE_WEIGHT, bce_weight=BCE_WEIGHT,
-                           boundary_weight=BOUNDARY_WEIGHT)
+    loss_fn = CombinedLoss(
+        bce_weight=0.4, 
+        tversky_weight=0.6, 
+        boundary_weight=0.0
+    ).to(DEVICE)
 
-    # !!! ИЗМЕНЕНИЕ SAM: оборачиваем оптимизатор в SAM если включено
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     optimizer = SAM(base_optimizer, rho=SAM_RHO) if USE_SAM else base_optimizer
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -792,12 +775,30 @@ def main():
     epochs_without_improvement = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
+        
+        if epoch <= WARMUP_EPOCHS:
+            loss_fn.bce_weight = 0.7       
+            loss_fn.tversky_weight = 0.3   
+            loss_fn.focal_tversky.alpha = 0.5 
+            loss_fn.focal_tversky.beta = 0.5
+            loss_fn.boundary_weight = 0.0 
+            print(f"Epoch {epoch}: BCE=0.7, Tversky(0.5,0.5)=0.3, Boundary=0.0")
+        else:
+            loss_fn.bce_weight = 0.4
+            loss_fn.tversky_weight = 0.5
+            loss_fn.focal_tversky.alpha = 0.3 
+            loss_fn.focal_tversky.beta = 0.7  
+            loss_fn.boundary_weight = 0.1  
+            print(f"Epoch {epoch}: BCE=0.4, Tversky(0.3,0.7)=0.5, Boundary=0.1")
+
+        # Запускаем обучение с уже обновленными весами внутри loss_fn
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler,
             visualization_dir=VISUALIZATION_DIR,
             visualize_every_n=VISUALIZE_EVERY_N_EPOCHS,
-            use_sam=USE_SAM,  # !!! ИЗМЕНЕНИЕ SAM: передаём флаг SAM
+            use_sam=USE_SAM,
         )
+
         val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
 
         scheduler.step()
@@ -821,7 +822,6 @@ def main():
         )
 
         # Сохранение last
-        # !!! ИЗМЕНЕНИЕ SAM: сохраняем state_dict базового оптимизатора
         optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
         torch.save(
             {
@@ -843,7 +843,6 @@ def main():
         if row["val_dice"] > best_val_dice:
             best_val_dice = row["val_dice"]
             epochs_without_improvement = 0  # Сброс счётчика
-            # !!! ИЗМЕНЕНИЕ SAM: сохраняем state_dict базового оптимизатора
             optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
             torch.save(
                 {

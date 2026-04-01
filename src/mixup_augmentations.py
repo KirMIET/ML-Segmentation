@@ -5,13 +5,14 @@ import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
-from segmentation_models_pytorch.encoders import get_preprocessing_fn
+
 
 def get_random_lambda(alpha: float = 0.4) -> float:
-    """Генерирует случайный коэффициент λ из Beta(α, α) распределения для MixUp/CutMix."""
+    """Генерирует случайный коэффициент λ из Beta(α, α) распределения для CutMix."""
     if alpha <= 0:
         return 1.0
     return np.random.beta(alpha, alpha)
+
 
 def get_random_bbox(h: int, w: int, area_ratio: float = 0.3) -> Tuple[int, int, int, int]:
     """Генерирует случайную bounding box заданной площади относительно изображения для CutMix."""
@@ -29,12 +30,20 @@ def get_random_bbox(h: int, w: int, area_ratio: float = 0.3) -> Tuple[int, int, 
 
     return x1, y1, x1 + obj_w, y1 + obj_h
 
+
+def create_coordinate_maps(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """Создаёт нормализованные координатные карты X и Y."""
+    x_coords = np.linspace(0, 1, width, dtype=np.float32)
+    y_coords = np.linspace(0, 1, height, dtype=np.float32)
+    x_map, y_map = np.meshgrid(x_coords, y_coords)
+    return x_map, y_map
+
+
 def extract_objects_from_mask(
     image: torch.Tensor, mask: torch.Tensor
 ) -> List[Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int, int]]]:
     """Извлекает отдельные объекты (связные компоненты) из изображения по маске для CopyPaste."""
     objects = []
-    # Переводим в uint8 (0 и 1)
     mask_np = mask.squeeze(0).cpu().numpy().astype(np.uint8)
 
     if mask_np.sum() == 0:
@@ -44,43 +53,21 @@ def extract_objects_from_mask(
         mask_np, connectivity=8
     )
 
-    for i in range(1, num_labels):  # Пропускаем фон (label 0)
+    for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
-        if area < 100:  # Пропускаем слишком мелкие объекты
+        if area < 100:
             continue
 
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(image.shape[2], x + w), min(image.shape[1], y + h)
 
-        # Вырезаем изображение
         obj_image = image[:, y1:y2, x1:x2].clone()
-
-        # ИСПРАВЛЕНИЕ: Создаем маску ИМЕННО ЭТОГО объекта (где label == i)
         component_mask = (labels[y1:y2, x1:x2] == i).astype(np.float32)
         obj_mask = torch.from_numpy(component_mask).unsqueeze(0).to(image.device)
 
         objects.append((obj_image, obj_mask, (x1, y1, x2, y2)))
 
     return objects
-
-class MixUpSegmentation:
-    """MixUp аугментация для бинарной сегментации с линейной интерполяцией изображений и масок."""
-
-    def __init__(self, alpha: float = 0.4, apply_prob: float = 0.5):
-        """Инициализирует MixUp с параметром alpha и вероятностью применения."""
-        self.alpha = alpha
-        self.apply_prob = apply_prob
-
-    def __call__(self, image1: torch.Tensor, mask1: torch.Tensor, image2: torch.Tensor, mask2: torch.Tensor):
-        """Применяет MixUp к паре изображений и масок, возвращая смешанные тензоры."""
-        if random.random() > self.apply_prob:
-            return image1, mask1
-
-        lambda_val = get_random_lambda(self.alpha)
-        mixed_image = lambda_val * image1 + (1 - lambda_val) * image2
-        mixed_mask = lambda_val * mask1 + (1 - lambda_val) * mask2
-
-        return mixed_image, mixed_mask
 
 class CutMixSegmentation:
     """CutMix аугментация для бинарной сегментации с вырезанием и вставкой прямоугольных областей."""
@@ -102,8 +89,18 @@ class CutMixSegmentation:
         mixed_image = image1.clone()
         mixed_mask = mask1.clone()
 
-        mixed_image[:, y1:y2, x1:x2] = image2[:, y1:y2, x1:x2]
+        # Копируем только RGB каналы (0:3), координатные каналы пересчитаем ниже
+        mixed_image[:3, y1:y2, x1:x2] = image2[:3, y1:y2, x1:x2]
         mixed_mask[:, y1:y2, x1:x2] = mask2[:, y1:y2, x1:x2]
+
+        # Пересчитываем координатные каналы для вставленной области (глобальные координаты)
+        if image1.shape[0] == 5:  # Если есть координатные каналы
+            # Создаём глобальные координаты для области вставки
+            x_coords = np.linspace(x1 / w, x2 / w, x2 - x1, dtype=np.float32)
+            y_coords = np.linspace(y1 / h, y2 / h, y2 - y1, dtype=np.float32)
+            x_map, y_map = np.meshgrid(x_coords, y_coords)
+            coord_maps = torch.from_numpy(np.stack([x_map, y_map], axis=0)).float().to(image1.device)
+            mixed_image[3:, y1:y2, x1:x2] = coord_maps
 
         return mixed_image, mixed_mask
 
@@ -115,17 +112,11 @@ class CopyPasteSegmentation:
         dataset_samples: Optional[List] = None,
         max_objects: int = 3,
         apply_prob: float = 0.5,
-        encoder_name: str = "timm-efficientnet-b0",
-        encoder_weights: str = "noisy-student",
     ):
         """Инициализирует CopyPaste с параметрами датасета, максимальным числом объектов и вероятностью."""
         self.dataset_samples = dataset_samples
         self.max_objects = max_objects
         self.apply_prob = apply_prob
-        self.preprocess_input = None
-
-        if encoder_weights is not None:
-            self.preprocess_input = get_preprocessing_fn(encoder_name, pretrained=encoder_weights)
 
     def _load_sample(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Загружает и предобрабатывает сэмпл из датасета по индексу."""
@@ -134,16 +125,24 @@ class CopyPasteSegmentation:
 
         image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        h, w = image_rgb.shape[0], image_rgb.shape[1]
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         mask = (mask > 0).astype(np.uint8)
 
-        if self.preprocess_input is not None:
-            image_rgb = self.preprocess_input(image_rgb)
-        else:
-            image_rgb = image_rgb.astype(np.float32) / 255.0
+        # Нормализация ImageNet (как в train_transforms)
+        image_rgb = image_rgb.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        image_rgb = (image_rgb - mean) / std
 
         image = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float()
+        
+        # Добавляем координатные каналы
+        x_map, y_map = create_coordinate_maps(h, w)
+        coords = torch.from_numpy(np.stack([x_map, y_map], axis=0)).float()
+        image = torch.cat([image, coords], dim=0)
+        
         mask = torch.from_numpy(mask[None, ...]).float()
         return image, mask
 
@@ -156,11 +155,9 @@ class CopyPasteSegmentation:
         obj_h, obj_w = obj_image.shape[1], obj_image.shape[2]
         tgt_h, tgt_w = target_image.shape[1], target_image.shape[2]
 
-        # ИСПРАВЛЕНИЕ: Добавляем случайный скейлинг для разнообразия размеров (важно для кассы!)
         scale_factor = random.uniform(0.6, 1.2)
         new_h, new_w = int(obj_h * scale_factor), int(obj_w * scale_factor)
 
-        # Защита от выхода за границы
         if new_h > tgt_h or new_w > tgt_w:
             scale = min(tgt_h / obj_h, tgt_w / obj_w)
             new_h, new_w = int(obj_h * scale), int(obj_w * scale)
@@ -183,10 +180,19 @@ class CopyPasteSegmentation:
 
         obj_mask_binary = (obj_mask > 0.5).float()
 
-        result_image[:, y1:y2, x1:x2] = (
-            obj_image * obj_mask_binary + result_image[:, y1:y2, x1:x2] * (1 - obj_mask_binary)
+        # Копируем только RGB каналы из объекта
+        result_image[:3, y1:y2, x1:x2] = (
+            obj_image[:3] * obj_mask_binary + result_image[:3, y1:y2, x1:x2] * (1 - obj_mask_binary)
         )
         result_mask[:, y1:y2, x1:x2] = torch.maximum(result_mask[:, y1:y2, x1:x2], obj_mask)
+
+        # Пересчитываем координатные каналы для вставленной области (глобальные координаты)
+        # if target_image.shape[0] == 5:
+        #     x_coords = np.linspace(x1 / tgt_w, x2 / tgt_w, x2 - x1, dtype=np.float32)
+        #     y_coords = np.linspace(y1 / tgt_h, y2 / tgt_h, y2 - y1, dtype=np.float32)
+        #     x_map, y_map = np.meshgrid(x_coords, y_coords)
+        #     coord_maps = torch.from_numpy(np.stack([x_map, y_map], axis=0)).float().to(target_image.device)
+        #     result_image[3:, y1:y2, x1:x2] = coord_maps
 
         return result_image, result_mask
 
@@ -222,18 +228,15 @@ class CopyPasteSegmentation:
 
 
 class SegmentationAugmentations:
-    """Комбинирует MixUp, CutMix и CopyPaste для удобного применения в Dataset."""
+    """Комбинирует CutMix и CopyPaste для удобного применения в Dataset."""
 
     def __init__(self, dataset_samples: Optional[List] = None, apply_prob: float = 0.5, **kwargs):
         """Инициализирует комбинированные аугментации с параметрами для каждой из них."""
-        self.mixup = MixUpSegmentation(alpha=kwargs.get("mixup_alpha", 0.4), apply_prob=1.0)
         self.cutmix = CutMixSegmentation(alpha=kwargs.get("cutmix_alpha", 1.0), apply_prob=1.0)
         self.copypaste = CopyPasteSegmentation(
             dataset_samples=dataset_samples,
             max_objects=kwargs.get("copypaste_max_objects", 3),
-            apply_prob=1.0,  # Контролируем вероятность внутри этого класса
-            encoder_name=kwargs.get("encoder_name", "timm-efficientnet-b0"),
-            encoder_weights=kwargs.get("encoder_weights", "noisy-student"),
+            apply_prob=1.0,
         )
         self.apply_prob = apply_prob
 
@@ -241,24 +244,18 @@ class SegmentationAugmentations:
         self, image: torch.Tensor, mask: torch.Tensor,
         source_image: Optional[torch.Tensor] = None, source_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Применяет случайную аугментацию (MixUp/CutMix/CopyPaste) к изображению и маске."""
+        """Применяет случайную аугментацию (CutMix/CopyPaste) к изображению и маске."""
 
-        # Если не повезло - отдаем оригинал
         if random.random() > self.apply_prob:
             return image, mask
 
-        # Собираем доступные опции
         choices = ["copypaste"]
         if source_image is not None and source_mask is not None:
-            # choices.extend(["mixup", "cutmix"])
             choices.extend(["cutmix"])
 
-        # Выбираем строго ОДНУ аугментацию
         aug_choice = random.choice(choices)
 
-        if aug_choice == "mixup":
-            return self.mixup(image, mask, source_image, source_mask)
-        elif aug_choice == "cutmix":
+        if aug_choice == "cutmix":
             return self.cutmix(image, mask, source_image, source_mask)
         elif aug_choice == "copypaste":
             return self.copypaste(image, mask)
