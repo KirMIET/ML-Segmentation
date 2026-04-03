@@ -10,5 +10,6 @@ seg_train_runs/
 changes/
 model_checkpoints/
 view_train_img/
+submissions/
 
 .qwen/
