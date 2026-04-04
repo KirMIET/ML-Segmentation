@@ -16,7 +16,7 @@ import segmentation_models_pytorch as smp
 # CONFIG
 # =========================
 TEST_IMAGES_DIR = Path(r"dataset/best_dataset/test_images")
-OUTPUT_CSV = "submissions/submission_change10.csv"
+OUTPUT_CSV = "submissions/submission_change10_no_coord.csv"
 
 # путь к вашему чекпоинту после обучения
 CHECKPOINT_PATH = Path(r"./model_checkpoints/best.pth")
@@ -27,11 +27,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_TTA = True
 USE_MULTI_SCALE = True
-USE_CRF = False
 USE_MORPHOLOGY = True
 
 # Multi-scale parameters
-SCALE_FACTORS = [0.75, 1.0, 1.25]
+SCALE_FACTORS = [0.72, 0.81, 1.0]
 
 # Morphology parameters
 MORPHOLOGY_MIN_SIZE = 100  # минимальный размер объекта (пиксели)
@@ -47,40 +46,6 @@ def create_coordinate_maps(height: int, width: int) -> tuple[np.ndarray, np.ndar
     y_coords = np.linspace(0, 1, height, dtype=np.float32)
     x_map, y_map = np.meshgrid(x_coords, y_coords)
     return x_map.copy(), y_map.copy()
-
-
-def apply_dense_crf(image_rgb: np.ndarray, prob_mask: np.ndarray, iter_count=5) -> np.ndarray:
-    """Применяет DenseCRF для выравнивания границ по пикселям."""
-    try:
-        import pydensecrf.densecrf as dcrf
-    except ImportError:
-        print("WARNING: pydensecrf not installed! Run `pip install pydensecrf`. Skipping CRF.")
-        return prob_mask
-
-    h, w = prob_mask.shape
-    U = np.stack([1.0 - prob_mask, prob_mask], axis=0)
-    U = -np.log(U + 1e-8)
-    U = U.reshape((2, -1)).astype(np.float32)
-
-    d = dcrf.DenseCRF2D(w, h, 2)
-    d.setUnaryEnergy(U)
-    d.addPairwiseGaussian(sxy=(3, 3), compat=3, kernel=dcrf.DIAG_KERNEL, normalization=dcrf.NORMALIZE_SYMMETRIC)
-    d.addPairwiseBilateral(sxy=(30, 30), srgb=(13, 13, 13), rgbim=image_rgb, compat=10, 
-                           kernel=dcrf.DIAG_KERNEL, normalization=dcrf.NORMALIZE_SYMMETRIC)
-
-    Q = d.inference(iter_count)
-    res = np.argmax(Q, axis=0).reshape((h, w))
-    return res.astype(np.float32)
-
-
-# def apply_morphology(mask: np.ndarray) -> np.ndarray:
-#     """Очищает маску от мелкого мусора и заделывает дырки."""
-#     kernel = np.ones((5, 5), np.uint8)
-#     # Opening (убирает мелкий мусор)
-#     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-#     # Closing (заделывает мелкие дырки внутри объектов)
-#     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-#     return mask
 
 
 def apply_morphology_skimage(mask: np.ndarray) -> np.ndarray:
@@ -123,7 +88,7 @@ MODEL_NAME = cfg["MODEL_NAME"]
 ENCODER_NAME = cfg["ENCODER_NAME"]
 IMG_SIZE = int(cfg["IMG_SIZE"])
 
-INPUT_CHANNELS = 5  
+INPUT_CHANNELS = 3
 
 print("Loaded checkpoint config:")
 print(f"MODEL_NAME     = {MODEL_NAME}")
@@ -288,17 +253,12 @@ with torch.no_grad():
         if pred_probs.shape != (H, W):
             pred_probs = cv2.resize(pred_probs, (W, H), interpolation=cv2.INTER_LINEAR)
 
-        # -------------------------------------
-        # 3. CRF POST-PROCESSING (Опционально)
-        # -------------------------------------
-        if USE_CRF:
-            pred_probs = apply_dense_crf(img_rgb, pred_probs)
 
         # Бинаризация
         mask = (pred_probs > THRESHOLD).astype(np.uint8)
 
         # -------------------------------------
-        # 4. MORPHOLOGY CLEANUP (Опционально)
+        # 3. MORPHOLOGY CLEANUP (Опционально)
         # -------------------------------------
         if USE_MORPHOLOGY:
             mask = apply_morphology_skimage(mask)

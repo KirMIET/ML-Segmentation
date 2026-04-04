@@ -46,7 +46,7 @@ WEIGHT_DECAY = 1e-4
 VAL_RATIO = 0.2
 NUM_WORKERS = 4
 SEED = 42
-THRESHOLD = 0.5
+THRESHOLD = 0.4
 
 USE_COORDINATES = True
 INPUT_CHANNELS = 5 if USE_COORDINATES else 3
@@ -254,9 +254,9 @@ def get_train_transforms(img_size: int | None = None) -> A.Compose:
 
         # Размытие (движение товаров)
         A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-        A.MotionBlur(blur_limit=7, p=0.3),
-        A.GaussNoise(var_limit=(7.5, 37.5), p=0.3),  # уменьшено на 25%
-        A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.075, 0.375), p=0.3),  # уменьшено на 25%
+        # A.MotionBlur(blur_limit=7, p=0.3),
+        A.GaussNoise(var_limit=(5, 25), p=0.3),  # уменьшено на 25%
+        # A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.075, 0.375), p=0.3),  # уменьшено на 25%
 
         # Морфологические операции
         A.OneOf(
