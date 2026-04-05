@@ -16,7 +16,7 @@ import segmentation_models_pytorch as smp
 # CONFIG
 # =========================
 TEST_IMAGES_DIR = Path(r"dataset/best_dataset/test_images")
-OUTPUT_CSV = "submissions/submission_change10_no_coord.csv"
+OUTPUT_CSV = "submissions/submission_change11_no_multiscale.csv"
 
 # путь к вашему чекпоинту после обучения
 CHECKPOINT_PATH = Path(r"./model_checkpoints/best.pth")
@@ -30,7 +30,7 @@ USE_MULTI_SCALE = True
 USE_MORPHOLOGY = True
 
 # Multi-scale parameters
-SCALE_FACTORS = [0.72, 0.81, 1.0]
+SCALE_FACTORS = [0.75, 1.0, 1.25]
 
 # Morphology parameters
 MORPHOLOGY_MIN_SIZE = 100  # минимальный размер объекта (пиксели)
@@ -88,7 +88,7 @@ MODEL_NAME = cfg["MODEL_NAME"]
 ENCODER_NAME = cfg["ENCODER_NAME"]
 IMG_SIZE = int(cfg["IMG_SIZE"])
 
-INPUT_CHANNELS = 3
+INPUT_CHANNELS = 5
 
 print("Loaded checkpoint config:")
 print(f"MODEL_NAME     = {MODEL_NAME}")
@@ -252,7 +252,6 @@ with torch.no_grad():
         # 2. Ресайз (на всякий случай, хотя код выше уже гарантирует размер H, W)
         if pred_probs.shape != (H, W):
             pred_probs = cv2.resize(pred_probs, (W, H), interpolation=cv2.INTER_LINEAR)
-
 
         # Бинаризация
         mask = (pred_probs > THRESHOLD).astype(np.uint8)

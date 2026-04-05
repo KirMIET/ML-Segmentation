@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.encoders import get_preprocessing_fn
 
@@ -155,6 +156,18 @@ def find_image_for_stem(images_dir: Path, stem: str) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+@torch.no_grad()
+def fast_update_bn(loader, model, device, max_steps=100):
+    """Быстрый пересчет статистик BatchNorm для EMA модели."""
+    model.train()  # Обязательно train(), чтобы BN собирал стату
+    for i, (images, _) in enumerate(loader):
+        if i >= max_steps:
+            break
+        images = images.to(device, non_blocking=True)
+        # Просто прогоняем forward, чтобы обновились running_mean и running_var
+        _ = model(images)
 
 
 def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-7) -> float:
@@ -590,6 +603,7 @@ class CombinedLoss(nn.Module):
 # =========================
 def train_one_epoch(
     model,
+    ema_model,
     loader,
     optimizer,
     loss_fn,
@@ -654,6 +668,9 @@ def train_one_epoch(
             grad_scaler.step(optimizer.base_optimizer)
             grad_scaler.update()
 
+            # Обновляем теневые EMA-веса
+            ema_model.update_parameters(model)
+
             final_loss = loss_perturbed
             final_logits = logits_perturbed
         else:
@@ -666,6 +683,10 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
             grad_scaler.step(optimizer)
             grad_scaler.update()
+
+            # Обновляем теневые EMA-веса
+            ema_model.update_parameters(model)
+
             final_loss = loss
             final_logits = logits
 
@@ -815,6 +836,10 @@ def main():
 
     model = build_model().to(DEVICE)
 
+    # Создаем EMA-модель (decay 0.999 - стандарт для батчей)
+    ema_avg = get_ema_multi_avg_fn(0.999)
+    ema_model = AveragedModel(model, multi_avg_fn=ema_avg).to(DEVICE)
+
     loss_fn = CombinedLoss(
         bce_weight=0.4,
         tversky_weight=0.6,
@@ -855,13 +880,18 @@ def main():
 
         # Запускаем обучение с уже обновленными весами внутри loss_fn
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler,
+            model, ema_model, train_loader, optimizer, loss_fn, DEVICE, epoch, NUM_EPOCHS, grad_scaler,
             visualization_dir=VISUALIZATION_DIR,
             visualize_every_n=VISUALIZE_EVERY_N_EPOCHS,
             use_sam=USE_SAM,
         )
 
+        # Валидация базовой модели
         val_metrics = validate_one_epoch(model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
+
+        # Пересчитываем BatchNorm для EMA-модели и валидируем её
+        fast_update_bn(train_loader, ema_model, DEVICE, max_steps=100)
+        val_metrics_ema = validate_one_epoch(ema_model, val_loader, loss_fn, DEVICE, epoch, NUM_EPOCHS)
 
         scheduler.step()
 
@@ -874,17 +904,36 @@ def main():
             "val_loss": val_metrics["loss"],
             "val_dice": val_metrics["dice"],
             "val_iou": val_metrics["iou"],
+            "val_loss_ema": val_metrics_ema["loss"],
+            "val_dice_ema": val_metrics_ema["dice"],
+            "val_iou_ema": val_metrics_ema["iou"],
         }
         history.append(row)
 
         print(
             f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
             f"train_loss={row['train_loss']:.4f} train_dice={row['train_dice']:.4f} train_iou={row['train_iou']:.4f} | "
-            f"val_loss={row['val_loss']:.4f} val_dice={row['val_dice']:.4f} val_iou={row['val_iou']:.4f}"
+            f"val_loss={row['val_loss']:.4f} val_dice={row['val_dice']:.4f} val_iou={row['val_iou']:.4f} | "
+            f"val_loss_ema={row['val_loss_ema']:.4f} val_dice_ema={row['val_dice_ema']:.4f} val_iou_ema={row['val_iou_ema']:.4f}"
         )
 
-        # Сохранение last
+        # Сохранение last (оба: EMA и base)
         optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": ema_model.module.state_dict(),
+                "optimizer_state_dict": optimizer_to_save.state_dict(),
+                "val_dice": row["val_dice"],
+                "config": {
+                    "MODEL_NAME": MODEL_NAME,
+                    "ENCODER_NAME": ENCODER_NAME,
+                    "ENCODER_WEIGHTS": ENCODER_WEIGHTS,
+                    "IMG_SIZE": IMG_SIZE,
+                },
+            },
+            SAVE_DIR / "last.pth",
+        )
         torch.save(
             {
                 "epoch": epoch,
@@ -898,14 +947,31 @@ def main():
                     "IMG_SIZE": IMG_SIZE,
                 },
             },
-            SAVE_DIR / "last.pth",
+            SAVE_DIR / "last_base.pth",
         )
 
         # Сохранение best и проверка early stopping
-        if row["val_dice"] > best_val_dice:
-            best_val_dice = row["val_dice"]
+        if row["val_dice_ema"] > best_val_dice:
+            best_val_dice = row["val_dice_ema"]
             epochs_without_improvement = 0  # Сброс счётчика
             optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
+            # Сохраняем EMA модель как best.pth
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": ema_model.module.state_dict(),
+                    "optimizer_state_dict": optimizer_to_save.state_dict(),
+                    "val_dice": row["val_dice_ema"],
+                    "config": {
+                        "MODEL_NAME": MODEL_NAME,
+                        "ENCODER_NAME": ENCODER_NAME,
+                        "ENCODER_WEIGHTS": ENCODER_WEIGHTS,
+                        "IMG_SIZE": IMG_SIZE,
+                    },
+                },
+                SAVE_DIR / "best.pth",
+            )
+            # Сохраняем базовую модель как best_base.pth
             torch.save(
                 {
                     "epoch": epoch,
@@ -919,7 +985,7 @@ def main():
                         "IMG_SIZE": IMG_SIZE,
                     },
                 },
-                SAVE_DIR / "best.pth",
+                SAVE_DIR / "best_base.pth",
             )
             print(f"Saved new best model with val_dice={best_val_dice:.4f}")
         else:
@@ -936,7 +1002,7 @@ def main():
 
     history_df = pd.DataFrame(history)
     history_df.to_csv(SAVE_DIR / "history.csv", index=False)
-    print(f"Training finished. Best val_dice={best_val_dice:.4f}")
+    print(f"Training finished. Best val_dice={best_val_dice:.4f} (base & EMA saved)")
 
 
 if __name__ == "__main__":
