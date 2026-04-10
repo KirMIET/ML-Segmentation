@@ -7,6 +7,7 @@ import torch
 import albumentations as A
 from segmentation_models_pytorch.encoders import get_preprocessing_fn
 
+from src.config import IMG_SIZE
 from src.augmentations import create_coordinate_maps
 
 
@@ -34,7 +35,7 @@ class BinarySegDataset(torch.utils.data.Dataset):
         self,
         images_dir: Path,
         masks_dir: Path,
-        img_size: int = 352,
+        img_size: int = IMG_SIZE,
         encoder_name: str = "resnet34",
         encoder_weights: str | None = "imagenet",
         augmentations: A.Compose | None = None,
@@ -69,6 +70,12 @@ class BinarySegDataset(torch.utils.data.Dataset):
 
         if not self.samples:
             raise RuntimeError(f"No paired image/mask samples found in {images_dir} / {masks_dir}")
+
+        # Кешируем координатные карты один раз (они не меняются для фиксированного размера)
+        self.coords_tensor = None
+        if self.use_coordinates:
+            x_map, y_map = create_coordinate_maps(self.img_size, self.img_size)
+            self.coords_tensor = torch.from_numpy(np.stack([x_map, y_map], axis=0)).float()
 
         print(f"  Dataset initialized with {len(self.samples)} samples")
 
@@ -113,19 +120,14 @@ class BinarySegDataset(torch.utils.data.Dataset):
         image_tensor = torch.from_numpy(image_rgb.transpose(2, 0, 1)).float()
         mask_tensor = torch.from_numpy(mask.astype(np.float32)[None, ...]).float()
 
-        # Добавляем координатные каналы
-        if self.use_coordinates:
-            h, w = image_tensor.shape[1], image_tensor.shape[2]
-            x_map, y_map = create_coordinate_maps(h, w)
-            coords = np.stack([x_map, y_map], axis=0)
-            coords_tensor = torch.from_numpy(coords).float()
-            image_tensor = torch.cat([image_tensor, coords_tensor], dim=0)
+        # Добавляем координатные каналы (используем кешированный тензор)
+        if self.use_coordinates and self.coords_tensor is not None:
+            image_tensor = torch.cat([image_tensor, self.coords_tensor], dim=0)
 
         return image_tensor, mask_tensor
 
     def __getitem__(self, idx: int):
-        # Выбираем случайный размер для multi-scale training
-        target_size = self.img_size  # по умолчанию
+        target_size = self.img_size
 
         image_tensor, mask_tensor = self._get_single_sample(idx, target_size)
 

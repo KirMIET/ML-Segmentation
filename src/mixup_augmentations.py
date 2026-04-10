@@ -6,6 +6,8 @@ import cv2
 import torch
 import torch.nn.functional as F
 
+from src.config import CUTMIX_ALPHA, AUGMENTATION_PROB, COPYPASTE_MAX_OBJECTS
+
 
 def get_random_lambda(alpha: float = 0.4) -> float:
     """Генерирует случайный коэффициент λ из Beta(α, α) распределения для CutMix."""
@@ -66,7 +68,7 @@ def extract_objects_from_mask(
 class CutMixSegmentation:
     """CutMix аугментация для бинарной сегментации с вырезанием и вставкой прямоугольных областей."""
 
-    def __init__(self, alpha: float = 1.0, apply_prob: float = 0.5):
+    def __init__(self, alpha: float = CUTMIX_ALPHA, apply_prob: float = AUGMENTATION_PROB):
         self.alpha = alpha
         self.apply_prob = apply_prob
 
@@ -78,11 +80,12 @@ class CutMixSegmentation:
         h, w = image1.shape[1], image1.shape[2]
         x1, y1, x2, y2 = get_random_bbox(h, w, area_ratio=1 - lambda_val)
 
-        mixed_image = image1.clone()
-        mixed_mask = mask1.clone()
+        # Создаем новые тензоры только для результата (без полного clone)
+        mixed_image = torch.empty_like(image1).copy_(image1)
+        mixed_mask = torch.empty_like(mask1).copy_(mask1)
 
-        # Копируем ТОЛЬКО RGB каналы. 
-        # Координатные каналы (если есть) остаются от image1, так как пространственное 
+        # Копируем ТОЛЬКО RGB каналы.
+        # Координатные каналы (если есть) остаются от image1, так как пространственное
         # положение этих пикселей в итоговом тензоре не изменилось.
         mixed_image[:3, y1:y2, x1:x2] = image2[:3, y1:y2, x1:x2]
         mixed_mask[:, y1:y2, x1:x2] = mask2[:, y1:y2, x1:x2]
@@ -93,7 +96,7 @@ class CutMixSegmentation:
 class CopyPasteSegmentation:
     """CopyPaste аугментация для сегментации товаров — копирование объектов из одного изображения в другое."""
 
-    def __init__(self, max_objects: int = 3, apply_prob: float = 0.5):
+    def __init__(self, max_objects: int = COPYPASTE_MAX_OBJECTS, apply_prob: float = AUGMENTATION_PROB):
         self.max_objects = max_objects
         self.apply_prob = apply_prob
 
@@ -123,8 +126,9 @@ class CopyPasteSegmentation:
         paste_y = random.randint(0, max_y) if max_y > 0 else 0
         paste_x = random.randint(0, max_x) if max_x > 0 else 0
 
-        result_image = target_image.clone()
-        result_mask = target_mask.clone()
+        # Создаем новые тензоры только для результата
+        result_image = torch.empty_like(target_image).copy_(target_image)
+        result_mask = torch.empty_like(target_mask).copy_(target_mask)
 
         y1, y2 = paste_y, paste_y + obj_h
         x1, x2 = paste_x, paste_x + obj_w
@@ -156,7 +160,9 @@ class CopyPasteSegmentation:
         random.shuffle(objects)
         num_objects_to_paste = min(random.randint(1, self.max_objects), len(objects))
 
-        result_image, result_mask = image.clone(), mask.clone()
+        # Создаем новые тензоры только для результата
+        result_image = torch.empty_like(image).copy_(image)
+        result_mask = torch.empty_like(mask).copy_(mask)
 
         for i in range(num_objects_to_paste):
             obj_image, obj_mask, _ = objects[i]
@@ -168,10 +174,16 @@ class CopyPasteSegmentation:
 class SegmentationAugmentations:
     """Комбинирует CutMix и CopyPaste для удобного применения в Dataset."""
 
-    def __init__(self, apply_prob: float = 0.5, **kwargs):
+    def __init__(
+        self,
+        apply_prob: float = AUGMENTATION_PROB,
+        cutmix_alpha: float = CUTMIX_ALPHA,
+        copypaste_max_objects: int = COPYPASTE_MAX_OBJECTS,
+        **kwargs
+    ):
         self.apply_prob = apply_prob
-        self.cutmix = CutMixSegmentation(alpha=kwargs.get("cutmix_alpha", 1.0), apply_prob=1.0)
-        self.copypaste = CopyPasteSegmentation(max_objects=kwargs.get("copypaste_max_objects", 3), apply_prob=1.0)
+        self.cutmix = CutMixSegmentation(alpha=cutmix_alpha, apply_prob=1.0)
+        self.copypaste = CopyPasteSegmentation(max_objects=copypaste_max_objects, apply_prob=1.0)
 
     def __call__(
         self, image: torch.Tensor, mask: torch.Tensor,

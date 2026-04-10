@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
+from src.config import THRESHOLD, SAM_RHO, SEED
+
 
 # =========================
 # SAM OPTIMIZER
@@ -16,7 +18,7 @@ import matplotlib.pyplot as plt
 class SAM:
     """SAM optimizer wrapper над базовым оптимизатором, совместимый с AMP GradScaler."""
 
-    def __init__(self, base_optimizer: torch.optim.Optimizer, rho: float = 0.05):
+    def __init__(self, base_optimizer: torch.optim.Optimizer, rho: float = SAM_RHO):
         self.rho = rho
         self.base_optimizer = base_optimizer
 
@@ -75,7 +77,7 @@ class SAM:
 # =========================
 # UTILS
 # =========================
-def seed_everything(seed: int = 42) -> None:
+def seed_everything(seed: int = SEED) -> None:
     """Устанавливает случайные сиды для воспроизводимости экспериментов."""
     random.seed(seed)
     np.random.seed(seed)
@@ -83,8 +85,8 @@ def seed_everything(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, 
-                           threshold: float = 0.4, eps: float = 1e-7) -> float:
+def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor,
+                           threshold: float = THRESHOLD, eps: float = 1e-7) -> float:
     """Вычисляет Dice score между предсказанными логитами и целевыми масками."""
     probs = torch.sigmoid(logits)
     preds = (probs > threshold).float()
@@ -99,8 +101,8 @@ def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor,
     return dice.mean().item()
 
 
-def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, 
-                          threshold: float = 0.4, eps: float = 1e-7) -> float:
+def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor,
+                          threshold: float = THRESHOLD, eps: float = 1e-7) -> float:
     """Вычисляет IoU score между предсказанными логитами и целевыми масками."""
     probs = torch.sigmoid(logits)
     preds = (probs > threshold).float()
@@ -117,7 +119,7 @@ def iou_score_from_logits(logits: torch.Tensor, targets: torch.Tensor,
 
 def visualize_batch(images: torch.Tensor, masks: torch.Tensor, logits: torch.Tensor,
                     save_path: Path, epoch: int, model_name: str, fold: int,
-                    num_samples: int = 4, threshold: float = 0.4) -> None:
+                    num_samples: int = 4, threshold: float = THRESHOLD) -> None:
     """Сохраняет визуализацию предсказаний модели для батча.
     
     Args:

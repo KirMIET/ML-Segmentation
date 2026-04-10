@@ -16,10 +16,10 @@ import segmentation_models_pytorch as smp
 # CONFIG
 # =========================
 TEST_IMAGES_DIR = Path(r"dataset/best_dataset/test_images")
-OUTPUT_CSV = "submissions/submission_change11_no_multiscale.csv"
+OUTPUT_CSV = "submissions/submission_segformer.csv"
 
 # путь к вашему чекпоинту после обучения
-CHECKPOINT_PATH = Path(r"./model_checkpoints/best.pth")
+CHECKPOINT_PATH = Path(r".\changes\change14\SegFormer_fold_1\best_SegFormer_fold_1.pth")
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 THRESHOLD = 0.5
@@ -70,6 +70,8 @@ def build_model(model_name: str, encoder_name: str, in_channels: int):
         return smp.UnetPlusPlus(encoder_name=encoder_name, encoder_weights=None, in_channels=in_channels, classes=1)
     elif model_name == "FPN":
         return smp.FPN(encoder_name=encoder_name, encoder_weights=None, in_channels=in_channels, classes=1)
+    elif model_name == "SegFormer":
+        return smp.Segformer(encoder_name=encoder_name, encoder_weights=None, in_channels=in_channels, classes=1)
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
 

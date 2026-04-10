@@ -1,13 +1,13 @@
 """
 Ensemble Segmentation Training Pipeline
 ========================================
-Trains 4 models (UNet++, FPN, SegFormer, UPerNet) on 4 folds with:
-- SAM optimizer
+Trains models (UNet++, FPN, SegFormer, UPerNet) on 4 folds with:
+- SAM optimizer (per-model configurable)
 - Combined dynamic loss (BCE + FocalTversky + Boundary)
-- Multi-scale training (256, 352)
+- Multi-scale training (per-model configurable)
 - CutMix + CopyPaste augmentations
 - AMP + gradient clipping + early stopping
-- 5-channel input (RGB + XY coordinates)
+- 3 or 5-channel input (RGB or RGB + XY coordinates, per-model configurable)
 """
 
 import random
@@ -19,6 +19,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from src.config import (
+    FOLD_DIR, SAVE_DIR, VISUALIZATION_DIR,
+    SEED, DEVICE, NUM_FOLDS,
+    IMG_SIZE, NUM_WORKERS, THRESHOLD,
+    VISUALIZE_EVERY_N_EPOCHS,
+    SAM_RHO, GRAD_CLIP_MAX_NORM,
+    CUTMIX_ALPHA, AUGMENTATION_PROB, COPYPASTE_MAX_OBJECTS,
+    USE_OHEM, OHEM_RATIO,
+    BCE_WEIGHT, TVERSKY_WEIGHT, BOUNDARY_WEIGHT,
+    MODEL_CONFIGS,
+)
 from src.losses import CombinedLoss
 from src.augmentations import get_train_transforms, get_val_transforms
 from src.dataset import BinarySegDataset, build_image_dict
@@ -31,94 +42,6 @@ from src.training_utils import (
     visualize_batch,
 )
 from src.mixup_augmentations import SegmentationAugmentations
-
-# =========================
-# GLOBAL CONFIG
-# =========================
-FOLD_DIR = Path("dataset/dataset_fold")
-SAVE_DIR = Path("./model_checkpoints")
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
-VISUALIZATION_DIR = Path("./view_train_img")
-VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
-VISUALIZE_EVERY_N_EPOCHS = 5
-
-IMG_SIZE = 352
-MULTI_SCALES = [256, 352]
-NUM_WORKERS = 4
-SEED = 42
-THRESHOLD = 0.4
-
-USE_COORDINATES = True
-INPUT_CHANNELS = 5 if USE_COORDINATES else 3
-
-# SAM
-USE_SAM = True
-SAM_RHO = 0.02
-
-# Gradient clipping
-GRAD_CLIP_MAX_NORM = 1.0
-
-# CutMix / CopyPaste
-CUTMIX_ALPHA = 1.0
-AUGMENTATION_PROB = 0.5
-
-# OHEM
-USE_OHEM = True
-OHEM_RATIO = 0.25
-
-NUM_FOLDS = 4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-MODEL_CONFIGS = {
-    "UnetPlusPlus": {
-        "model_name": "UnetPlusPlus",
-        "encoder_name": "timm-efficientnet-b3",
-        "encoder_weights": "noisy-student",
-        "batch_size": 12,            
-        "lr": 1e-3,
-        "num_epochs": 35,    
-        "warmup_epochs": 3,
-        "early_stopping_patience": 7,
-        "weight_decay": 1e-4,
-    },
-    
-    "FPN": {
-        "model_name": "FPN",
-        "encoder_name": "tu-convnext_small",
-        "encoder_weights": "imagenet",
-        "batch_size": 12,           
-        "lr": 5e-4,
-        "num_epochs": 35,
-        "warmup_epochs": 3,
-        "early_stopping_patience": 7,
-        "weight_decay": 1e-4,
-    },
-    
-    "SegFormer": {
-        "model_name": "SegFormer",
-        "encoder_name": "mit_b2",   
-        "encoder_weights": "imagenet",
-        "batch_size": 12,
-        "lr": 2e-4,                
-        "num_epochs": 40,        
-        "warmup_epochs": 4,
-        "early_stopping_patience": 8,
-        "weight_decay": 1e-4,
-    },
-    
-    "UPerNet": {
-        "model_name": "UPerNet",
-        "encoder_name": "resnext50_32x4d",
-        "encoder_weights": "swsl", 
-        "batch_size": 8,       
-        "lr": 3e-4,
-        "num_epochs": 35,
-        "warmup_epochs": 3,
-        "early_stopping_patience": 7,
-        "weight_decay": 1e-4,
-    },
-}
 
 
 def collect_samples(images_dir: Path, masks_dir: Path) -> list:
@@ -143,7 +66,7 @@ def train_single_fold(
     masks_dir: Path,
 ) -> dict:
     """Обучает одну модель на одном фолде.
-    
+
     Args:
         fold: Номер фолда (1-4).
         model_name: Имя модели.
@@ -152,7 +75,7 @@ def train_single_fold(
         val_samples: Сэмплы для валидации.
         images_dir: Директория с изображениями.
         masks_dir: Директория с масками.
-        
+
     Returns:
         История обучения (list of dicts).
     """
@@ -165,10 +88,19 @@ def train_single_fold(
     encoder_name = model_config["encoder_name"]
     encoder_weights = model_config["encoder_weights"]
 
+    # Per-model settings
+    use_coordinates = model_config.get("use_coordinates", True)
+    use_sam = model_config.get("use_sam", True)
+    multi_scales = model_config.get("multi_scales", [IMG_SIZE])
+    if multi_scales is None or len(multi_scales) == 0:
+        multi_scales = [IMG_SIZE]
+    input_channels = 5 if use_coordinates else 3
+
     print(f"\n{'='*60}")
     print(f"Training {model_name} on Fold {fold}")
     print(f"  LR={lr}, BS={batch_size}, Epochs={num_epochs}, Warmup={warmup_epochs}")
     print(f"  Early Stopping Patience={early_stopping_patience}")
+    print(f"  Coords={use_coordinates}, SAM={use_sam}, Scales={multi_scales}")
     print(f"{'='*60}")
 
     # Создаем трансформы
@@ -184,13 +116,13 @@ def train_single_fold(
         encoder_weights=encoder_weights,
         augmentations=train_transforms,
         samples=train_samples,
-        use_coordinates=USE_COORDINATES,
+        use_coordinates=use_coordinates,
     )
 
     train_dataset.custom_augs = SegmentationAugmentations(
         apply_prob=AUGMENTATION_PROB,
         cutmix_alpha=CUTMIX_ALPHA,
-        copypaste_max_objects=3,
+        copypaste_max_objects=COPYPASTE_MAX_OBJECTS,
     )
 
     val_dataset = BinarySegDataset(
@@ -201,7 +133,7 @@ def train_single_fold(
         encoder_weights=encoder_weights,
         augmentations=val_transforms,
         samples=val_samples,
-        use_coordinates=USE_COORDINATES,
+        use_coordinates=use_coordinates,
     )
 
     train_loader = DataLoader(
@@ -222,7 +154,7 @@ def train_single_fold(
     )
 
     # Создаем модель
-    model = create_model(model_name, in_channels=INPUT_CHANNELS).to(DEVICE)
+    model = create_model(model_name, in_channels=input_channels).to(DEVICE)
 
     # # PyTorch 2.0+ compilation для ускорения (15-20%)
     # try:
@@ -233,18 +165,18 @@ def train_single_fold(
 
     # Создаем лосс, оптимизатор, scheduler
     loss_fn = CombinedLoss(
-        bce_weight=0.4,
-        tversky_weight=0.5,
-        boundary_weight=0.1,
+        bce_weight=BCE_WEIGHT,
+        tversky_weight=TVERSKY_WEIGHT,
+        boundary_weight=BOUNDARY_WEIGHT,
         use_ohem=USE_OHEM,
         ohem_ratio=OHEM_RATIO,
     ).to(DEVICE)
 
     base_optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    optimizer = SAM(base_optimizer, rho=SAM_RHO) if USE_SAM else base_optimizer
+    optimizer = SAM(base_optimizer, rho=SAM_RHO) if use_sam else base_optimizer
 
     # LR Warmup: LinearLR + CosineAnnealingLR через SequentialLR
-    opt = optimizer.base_optimizer if USE_SAM else optimizer
+    opt = optimizer.base_optimizer if use_sam else optimizer
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         opt, start_factor=0.01, total_iters=warmup_epochs
     )
@@ -257,7 +189,11 @@ def train_single_fold(
 
     grad_scaler = torch.amp.GradScaler()
 
-    # Пути для сохранения
+    # Создаём подпапку для чекпоинтов этой модели/фолда
+    checkpoint_subdir = SAVE_DIR / f"{model_name}_fold_{fold}"
+    checkpoint_subdir.mkdir(parents=True, exist_ok=True)
+
+    # Пути для сохранения (в подпапке)
     model_save_prefix = f"best_{model_name}_fold_{fold}"
     last_save_prefix = f"last_{model_name}_fold_{fold}"
     vis_dir = VISUALIZATION_DIR / f"{model_name}_fold_{fold}"
@@ -290,8 +226,8 @@ def train_single_fold(
             device=DEVICE,
             epoch=epoch,
             grad_scaler=grad_scaler,
-            multi_scales=MULTI_SCALES,
-            use_sam=USE_SAM,
+            multi_scales=multi_scales,
+            use_sam=use_sam,
             grad_clip_max_norm=GRAD_CLIP_MAX_NORM,
         )
 
@@ -308,7 +244,7 @@ def train_single_fold(
         # Логирование
         row = {
             "epoch": epoch,
-            "lr": optimizer.base_optimizer.param_groups[0]["lr"] if USE_SAM else optimizer.param_groups[0]["lr"],
+            "lr": optimizer.base_optimizer.param_groups[0]["lr"] if use_sam else optimizer.param_groups[0]["lr"],
             "train_loss": train_metrics["loss"],
             "train_dice": train_metrics["dice"],
             "train_iou": train_metrics["iou"],
@@ -346,7 +282,7 @@ def train_single_fold(
                     pass
 
         # Сохранение last (каждую эпоху)
-        optimizer_to_save = optimizer.base_optimizer if USE_SAM else optimizer
+        optimizer_to_save = optimizer.base_optimizer if use_sam else optimizer
         torch.save(
             {
                 "fold": fold,
@@ -361,7 +297,7 @@ def train_single_fold(
                     "IMG_SIZE": IMG_SIZE,
                 },
             },
-            SAVE_DIR / f"{last_save_prefix}.pth",
+            checkpoint_subdir / f"{last_save_prefix}.pth",
         )
 
         # Сохранение best и проверка early stopping
@@ -388,7 +324,7 @@ def train_single_fold(
                         "IMG_SIZE": IMG_SIZE,
                     },
                 },
-                SAVE_DIR / f"{model_save_prefix}.pth",
+                checkpoint_subdir / f"{model_save_prefix}.pth",
             )
             print(f"  >>> Saved new best model with val_score={best_val_score:.4f} "
                   f"(dice={row['val_dice']:.4f}, iou={row['val_iou']:.4f})")
@@ -405,7 +341,7 @@ def train_single_fold(
     # Сохранение истории
     import pandas as pd
     history_df = pd.DataFrame(history)
-    history_path = SAVE_DIR / f"history_{model_name}_fold_{fold}.csv"
+    history_path = checkpoint_subdir / f"history_{model_name}_fold_{fold}.csv"
     history_df.to_csv(history_path, index=False)
     print(f"\n  Training finished. Best val_score={best_val_score:.4f}")
     print(f"  History saved to {history_path}")
@@ -427,11 +363,17 @@ def main():
     print(f"Ensemble Training Pipeline")
     print(f"{'='*60}")
     print(f"Device: {DEVICE}")
-    print(f"Input channels: {INPUT_CHANNELS} (5 = RGB + XY coords)")
-    print(f"Multi-scales: {MULTI_SCALES}")
     print(f"Number of folds: {NUM_FOLDS}")
     print(f"Models: {list(MODEL_CONFIGS.keys())}")
     print(f"Total experiments: {NUM_FOLDS} folds x {len(MODEL_CONFIGS)} models = {NUM_FOLDS * len(MODEL_CONFIGS)}")
+    # Выводим конфигурацию каждой модели
+    for mname, mcfg in MODEL_CONFIGS.items():
+        coords = mcfg.get("use_coordinates", True)
+        sam = mcfg.get("use_sam", True)
+        scales = mcfg.get("multi_scales", [IMG_SIZE])
+        if scales is None:
+            scales = [IMG_SIZE]
+        print(f"  {mname}: channels={5 if coords else 3}, SAM={sam}, scales={scales}")
     print(f"{'='*60}")
 
     # Цикл по фолдам

@@ -1,71 +1,59 @@
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 
-
-def create_unetpp_efficientnet_b3(in_channels: int = 5) -> nn.Module:
-    """Создаёт UNet++ с encoder timm-efficientnet-b3."""
-    return smp.UnetPlusPlus(
-        encoder_name="timm-efficientnet-b3",
-        encoder_weights="noisy-student",
-        in_channels=in_channels,
-        classes=1,
-        activation=None,
-    )
+from src.config import MODEL_CONFIGS, DEFAULT_IN_CHANNELS, DEFAULT_NUM_CLASSES
 
 
-def create_fpn_convnext_small(in_channels: int = 5) -> nn.Module:
-    """Создаёт FPN с encoder timm-convnext_small."""
-    return smp.FPN(
-        encoder_name="tu-convnext_small",
-        encoder_weights="imagenet",
-        in_channels=in_channels,
-        classes=1,
-        activation=None,
-    )
-
-
-def create_segformer_mit_b3(in_channels: int = 5) -> nn.Module:
-    """Создаёт SegFormer с encoder mit_b2."""
-    return smp.Segformer(
-        encoder_name="mit_b2",
-        encoder_weights="imagenet",
-        in_channels=in_channels,
-        classes=1,
-        activation=None,
-    )
-
-
-def create_upernet_convnext_base(in_channels: int = 5) -> nn.Module:
-    """Создаёт UPerNet с encoder convnext_base."""
-    return smp.UPerNet(
-        encoder_name="resnext50_32x4d",
-        encoder_weights="swsl",
-        in_channels=in_channels,
-        classes=1,
-        activation=None,
-    )
-
-
-def create_model(model_name: str, in_channels: int = 5) -> nn.Module:
+def create_model(model_name: str, in_channels: int = DEFAULT_IN_CHANNELS) -> nn.Module:
     """Фабричная функция для создания модели по имени.
-    
+
+    Читает параметры напрямую из MODEL_CONFIGS, чтобы избежать дублирования.
+
     Args:
         model_name: Имя модели из MODEL_CONFIGS.
         in_channels: Количество входных каналов (5 для RGB + координаты).
-        
+
     Returns:
         Модель сегментации.
-        
+
     Raises:
         ValueError: Если модель не поддерживается.
     """
+    cfg = MODEL_CONFIGS[model_name]
+    encoder_name = cfg["encoder_name"]
+    encoder_weights = cfg["encoder_weights"]
+
     if model_name == "UnetPlusPlus":
-        return create_unetpp_efficientnet_b3(in_channels)
+        return smp.UnetPlusPlus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=DEFAULT_NUM_CLASSES,
+            activation=None,
+        )
     elif model_name == "FPN":
-        return create_fpn_convnext_small(in_channels)
+        return smp.FPN(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=DEFAULT_NUM_CLASSES,
+            activation=None,
+        )
     elif model_name == "SegFormer":
-        return create_segformer_mit_b3(in_channels)
+        return smp.Segformer(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=DEFAULT_NUM_CLASSES,
+            activation=None,
+        )
     elif model_name == "UPerNet":
-        return create_upernet_convnext_base(in_channels)
+        return smp.UPerNet(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=DEFAULT_NUM_CLASSES,
+            activation=None,
+        )
     else:
         raise ValueError(f"Unsupported model: {model_name}")
